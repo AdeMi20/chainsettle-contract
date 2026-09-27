@@ -35,6 +35,9 @@ pub const DEFAULT_MAX_MILESTONE_COUNT: u32 = 50;
 /// admin has not configured an override. 8000 = 80%.
 pub const DEFAULT_EMERGENCY_FREEZE_SUPERMAJORITY_BPS: u32 = 8_000;
 
+/// Max shipments accepted by `batch_cancel_shipments` (#580) in one call.
+pub const MAX_BATCH_CANCEL_SHIPMENTS: u32 = 20;
+
 /// Maximum basis points a shipment creator may configure for a value-scaled
 /// dispute bond (#391) when the admin has not set a stricter cap via
 /// `set_max_dispute_bond_bps`. 2000 = 20% of shipment value.

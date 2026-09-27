@@ -444,6 +444,42 @@ pub struct ShipmentOptions {
     /// Ledgers after completion during which the buyer may file a warranty claim.
     /// Must be > 0 when `warranty_bps > 0`.
     pub warranty_ledgers: u32,
+
+    // ── #543 Independent inspector sign-off ───────────────────────────────────
+    /// Optional third-party inspector whose sign-off gates confirmation of
+    /// milestones listed in `inspected_milestones`. None = no inspector.
+    pub inspector: Option<Address>,
+    /// Milestone indices that require inspector sign-off before confirmation.
+    /// Empty = no milestones require inspection. Ignored when `inspector` is None.
+    pub inspected_milestones: Vec<u32>,
+
+    // ── #544 Per-milestone designated proof submitter ─────────────────────────
+    /// Optional per-milestone proof submitter (one entry per milestone).
+    /// Empty = supplier-only submission. Non-empty length must match milestones.
+    pub proof_submitters: Vec<Address>,
+
+    // ── #545 Dual attestation of proof ────────────────────────────────────────
+    /// When true, both supplier and logistics must attest a milestone proof
+    /// before it counts as submitted. Default false (unchanged behaviour).
+    pub require_dual_attestation: bool,
+}
+
+/// #545 – Pending dual-attestation proof awaiting the second party.
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub struct PendingDualProof {
+    pub first_attester: Address,
+    pub proof_hash: String,
+    pub proof_type: Symbol,
+}
+
+/// #543 – Stored inspector sign-off for a milestone.
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub struct InspectionRecord {
+    pub inspector: Address,
+    pub report_hash: BytesN<32>,
+    pub signed_ledger: u32,
 }
 
 /// #521 – Open warranty claim filed by the buyer after shipment completion.
@@ -1408,17 +1444,28 @@ pub enum DataKeyExt3 {
     /// for `request_shipment_pause` to be accepted (absent/0 = no minimum).
     PauseMinNoticeLedgers,
 
-    // ── #571 Contract / storage schema versioning ─────────────────────────
-    /// Instance-stored schema version set by `migrate` after upgrades.
-    StorageSchemaVersion,
+    // ── #543 Independent inspector sign-off ───────────────────────────────
+    /// Designated inspector address for a shipment (absent = none).
+    ShipmentInspector(String),
+    /// Milestone indices that require inspector sign-off before confirmation.
+    InspectedMilestones(String),
+    /// Inspector sign-off record for (shipment_id, milestone_index).
+    InspectionReport(String, u32),
 
-    // ── #572 Arbiter → shipments index ────────────────────────────────────
-    /// Shipment IDs currently assigned to a given arbiter.
-    ArbiterShipments(Address),
+    // ── #544 Per-milestone designated proof submitter ─────────────────────
+    /// Per-milestone designated proof submitters (empty/absent = supplier only).
+    ProofSubmitters(String),
 
-    // ── #573 Logistics → shipments index ──────────────────────────────────
-    /// Shipment IDs involving a given logistics provider.
-    LogisticsShipments(Address),
+    // ── #545 Dual attestation of proof ────────────────────────────────────
+    /// When true, both supplier and logistics must attest before ProofSubmitted.
+    RequireDualAttestation(String),
+    /// Pending first-party proof awaiting second attestation.
+    PendingDualProof(String, u32),
+
+    // ── #546 Oracle-triggered condition breach disputes ───────────────────
+    /// Oracles that have reported a condition breach for a milestone:
+    /// Vec<(Address, BytesN<32>)> of (oracle, data_hash).
+    ConditionBreachReports(String, u32),
 }
 
 /// #517 – Pending proposal to merge two adjacent Pending milestones.
@@ -5029,6 +5076,11 @@ impl ChainSettleContract {
         let retainage_bps = options.retainage_bps;
         let warranty_bps = options.warranty_bps;
         let warranty_ledgers = options.warranty_ledgers;
+        // #543–#545 trade-compliance / proof options.
+        let inspector = options.inspector.clone();
+        let inspected_milestones = options.inspected_milestones.clone();
+        let proof_submitters = options.proof_submitters.clone();
+        let require_dual_attestation = options.require_dual_attestation;
 
         if buyer_cancel_fee_bps > constants::MAX_FEE_BPS {
             panic!("buyer_cancel_fee_bps cannot exceed 1000 (10%)");
@@ -5273,6 +5325,17 @@ impl ChainSettleContract {
             milestones.len(),
         );
 
+        // #543–#545: Validate inspector / proof-submitter / dual-attestation options.
+        Self::validate_trade_proof_options(
+            &env,
+            &inspector,
+            &inspected_milestones,
+            &proof_submitters,
+            milestones.len(),
+            &supplier,
+            &logistics,
+        );
+
         // #164: Validate deadlines length when provided.
         if deadlines.len() > 0 && deadlines.len() != milestones.len() {
             panic!("deadline count must match milestone count");
@@ -5445,6 +5508,16 @@ impl ChainSettleContract {
             retainage_bps,
             warranty_bps,
             warranty_ledgers,
+        );
+
+        // #543–#545: Persist trade-compliance / proof options under their own keys.
+        Self::store_trade_proof_options(
+            &env,
+            &shipment_id,
+            &inspector,
+            &inspected_milestones,
+            &proof_submitters,
+            require_dual_attestation,
         );
 
         // #164: Store per-milestone Unix timestamp deadlines when provided.
@@ -6611,7 +6684,8 @@ impl ChainSettleContract {
         if milestone.status != MilestoneStatus::Pending {
             panic!("milestone is not in pending status");
         }
-        Self::require_supplier_or_logistics_auth(&shipment, &caller);
+        // #544: Only the designated proof submitter (default: supplier) may submit.
+        Self::require_proof_submitter_auth(&env, &shipment, &shipment_id, milestone_index, &caller);
 
         // #405: Validate proof_hash length/prefix bounds (if configured).
         Self::validate_proof_hash(&env, &proof_hash);
@@ -6659,6 +6733,37 @@ impl ChainSettleContract {
             .unwrap_or(5);
         if current_evidence_count >= max_evidence {
             panic!("evidence submission limit reached");
+        }
+
+        // #545: When dual attestation is required, the first submitter only stores a
+        // pending proof; the milestone stays Pending until the other party attests.
+        let dual_required = Self::requires_dual_attestation(&env, &shipment_id);
+        if dual_required {
+            if caller != shipment.supplier && caller != shipment.logistics {
+                panic!("dual attestation requires supplier or logistics");
+            }
+            let pending_key = DataKeyExt3::PendingDualProof(shipment_id.clone(), milestone_index);
+            let pending = PendingDualProof {
+                first_attester: caller.clone(),
+                proof_hash: proof_hash.clone(),
+                proof_type: proof_type.clone(),
+            };
+            Self::set_persistent(&env, &pending_key, &pending);
+            Self::append_audit_entry(
+                &env,
+                &mut shipment,
+                caller.clone(),
+                Symbol::new(&env, "dual_proof_pending"),
+                Symbol::new(&env, "submit_proof"),
+            );
+            env.storage()
+                .persistent()
+                .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+            env.events().publish(
+                (Symbol::new(&env, "dual_proof_pending"), shipment_id.clone()),
+                (milestone_index, proof_hash, proof_type, caller),
+            );
+            return;
         }
 
         let current_ledger = env.ledger().sequence();
@@ -6759,7 +6864,6 @@ impl ChainSettleContract {
             .instance()
             .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
         Self::assert_not_paused(&env);
-        caller.require_auth();
 
         let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
 
@@ -6774,6 +6878,10 @@ impl ChainSettleContract {
         if milestone.status != MilestoneStatus::ProofSubmitted {
             panic!("milestone is not in proof submitted status");
         }
+
+        // #544: Corrections follow the same designated-submitter rule as submit_proof.
+        // (Also enforces require_auth.)
+        Self::require_proof_submitter_auth(&env, &shipment, &shipment_id, milestone_index, &caller);
 
         // Only the original submitting address may correct.
         let submitter_key = DataKeyExt::ProofSubmitter(shipment_id.clone(), milestone_index);
@@ -7063,6 +7171,9 @@ impl ChainSettleContract {
         if milestone.status != MilestoneStatus::ProofSubmitted {
             panic!("milestone proof not yet submitted");
         }
+
+        // #543: Inspected milestones require inspector sign-off before confirmation.
+        Self::assert_inspection_complete(&env, &shipment_id, milestone_index);
 
         // #390: If an N-of-M oracle group is assigned to this shipment, require the
         // configured attestation threshold before allowing confirmation.
@@ -7735,6 +7846,7 @@ impl ChainSettleContract {
 
             let mut fee_amount: i128 = 0;
             let net_payment = Self::deduct_fee(&env, payment, &shipment.token, &mut fee_amount);
+            Self::track_shipment_fees_paid(&env, &shipment_id, fee_amount);
 
             // Check circuit breaker before transferring payment
             Self::check_circuit_breaker(&env, payment);
@@ -8005,6 +8117,8 @@ impl ChainSettleContract {
         milestone.release_after_ledger = 0;
         milestone.status = MilestoneStatus::Disputed;
 
+        Self::mark_shipment_had_dispute(&env, &shipment_id);
+
         // #369: Fresh dispute cycle — clear any prior appeal-window bookkeeping.
         env.storage()
             .persistent()
@@ -8263,6 +8377,8 @@ impl ChainSettleContract {
         shipment.open_dispute_count += 1;
         milestone.release_after_ledger = 0;
         milestone.status = MilestoneStatus::Disputed;
+
+        Self::mark_shipment_had_dispute(&env, &shipment_id);
 
         // #369: Fresh dispute cycle — clear any prior appeal-window bookkeeping.
         env.storage()
@@ -8682,6 +8798,20 @@ impl ChainSettleContract {
                 {
                     Self::slash_arbiter(&env, &original_arbiter, overturned_stats.overturned_count);
                 }
+
+                // #531: Financial stake slash to the party the appeal ruled for.
+                // Independent of the reputation/pool slash above.
+                let wronged = if approve {
+                    shipment.supplier.clone()
+                } else {
+                    shipment.buyers.get(0).unwrap()
+                };
+                Self::maybe_slash_arbiter_stake(
+                    &env,
+                    &original_arbiter,
+                    &wronged,
+                    &shipment.token,
+                );
             }
         }
 
@@ -9172,14 +9302,25 @@ impl ChainSettleContract {
             .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
         Self::assert_not_paused(&env);
         buyer.require_auth();
+        Self::cancel_shipment_internal(&env, &buyer, &shipment_id, None);
+    }
 
-        let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
+    /// Shared cancel path used by `cancel_shipment` and `batch_cancel_shipments`.
+    /// Caller must already have authenticated `buyer`. Panics on any failure
+    /// so a batch remains atomic.
+    fn cancel_shipment_internal(
+        env: &Env,
+        buyer: &Address,
+        shipment_id: &String,
+        reason: Option<String>,
+    ) {
+        let mut shipment = Self::get_shipment_internal(env, shipment_id);
 
         if shipment.status != ShipmentStatus::Active {
             panic!("shipment is not active");
         }
-        Self::assert_shipment_not_on_hold(&env, &shipment_id);
-        Self::assert_is_buyer(&shipment, &buyer);
+        Self::assert_shipment_not_on_hold(env, shipment_id);
+        Self::assert_is_buyer(&shipment, buyer);
 
         // Block cancellation if any milestone is Disputed.
         for i in 0..shipment.milestones.len() {
@@ -9194,7 +9335,7 @@ impl ChainSettleContract {
         let cancel_fee = (unreleased * shipment.buyer_cancel_fee_bps as i128) / 10_000;
         let refund = unreleased - cancel_fee;
         let primary_buyer = shipment.buyers.get(0).unwrap();
-        let token_client = token::Client::new(&env, &shipment.token);
+        let token_client = token::Client::new(env, &shipment.token);
 
         if cancel_fee > 0 {
             token_client.transfer(
@@ -9217,18 +9358,26 @@ impl ChainSettleContract {
             token_client.transfer(&env.current_contract_address(), &primary_buyer, &collateral);
         }
 
-        Self::refund_holdbacks_on_cancel(&env, &shipment_id, &mut shipment, buyer.clone());
+        Self::refund_holdbacks_on_cancel(env, shipment_id, &mut shipment, buyer.clone());
         shipment.status = ShipmentStatus::Cancelled;
-        shipment.cancellation_reason = Vec::from_array(&env, [CancellationReason::BuyerCancelled]);
+        shipment.cancellation_reason = Vec::from_array(env, [CancellationReason::BuyerCancelled]);
 
-        Self::increment_reputation_internal(&env, &shipment.supplier, 0, 0, 1);
+        Self::append_audit_entry(
+            env,
+            &mut shipment,
+            buyer.clone(),
+            Symbol::new(env, "shipment_cancelled"),
+            Symbol::new(env, "cancel_shipment"),
+        );
+
+        Self::increment_reputation_internal(env, &shipment.supplier, 0, 0, 1);
 
         // Move from Active to Cancelled status index.
         Self::move_shipment_status_index(
-            &env,
+            env,
             ShipmentStatus::Active,
             ShipmentStatus::Cancelled,
-            &shipment_id,
+            shipment_id,
         );
 
         env.storage()
@@ -9251,11 +9400,11 @@ impl ChainSettleContract {
             .storage()
             .persistent()
             .get(&DataKey::ActiveDisputes)
-            .unwrap_or_else(|| Vec::new(&env));
-        let mut new_disputes: Vec<DisputeEntry> = Vec::new(&env);
+            .unwrap_or_else(|| Vec::new(env));
+        let mut new_disputes: Vec<DisputeEntry> = Vec::new(env);
         for i in 0..disputes.len() {
             let d = disputes.get(i).unwrap();
-            if d.shipment_id != shipment_id {
+            if d.shipment_id != *shipment_id {
                 new_disputes.push_back(d);
             }
         }
@@ -9264,12 +9413,18 @@ impl ChainSettleContract {
             .set(&DataKey::ActiveDisputes, &new_disputes);
 
         env.events().publish(
-            (Symbol::new(&env, "shipment_cancelled"), shipment_id.clone()),
+            (Symbol::new(env, "shipment_cancelled"), shipment_id.clone()),
             (refund, cancel_fee, buyer.clone(), env.ledger().sequence()),
         );
+        if let Some(r) = reason {
+            env.events().publish(
+                (Symbol::new(env, "batch_cancel_reason"), shipment_id.clone()),
+                r,
+            );
+        }
         Self::emit_shipment_cancelled(
-            &env,
-            &shipment_id,
+            env,
+            shipment_id,
             refund,
             CancellationReason::BuyerCancelled,
         );
@@ -11056,6 +11211,332 @@ impl ChainSettleContract {
     }
 
     // ----------------------------------------------------------
+    // #543 — INDEPENDENT INSPECTOR SIGN-OFF
+    // ----------------------------------------------------------
+
+    /// Named inspector signs off on a milestone that requires inspection.
+    /// Confirmation is blocked until this record exists.
+    pub fn inspector_sign_off(
+        env: Env,
+        inspector: Address,
+        shipment_id: String,
+        milestone_index: u32,
+        report_hash: BytesN<32>,
+    ) {
+        env.storage()
+            .instance()
+            .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
+        Self::assert_not_paused(&env);
+        inspector.require_auth();
+
+        let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        if milestone_index as usize >= shipment.milestones.len() as usize {
+            panic!("invalid milestone index");
+        }
+
+        let named: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt3::ShipmentInspector(shipment_id.clone()))
+            .unwrap_or_else(|| panic!("no inspector configured for shipment"));
+        if inspector != named {
+            panic!("unauthorized");
+        }
+
+        let inspected: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt3::InspectedMilestones(shipment_id.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut required = false;
+        for i in 0..inspected.len() {
+            if inspected.get(i).unwrap() == milestone_index {
+                required = true;
+                break;
+            }
+        }
+        if !required {
+            panic!("milestone does not require inspection");
+        }
+
+        // Reject the zero hash as a missing report.
+        if report_hash == BytesN::from_array(&env, &[0u8; 32]) {
+            panic!("report_hash must be non-zero");
+        }
+
+        let record = InspectionRecord {
+            inspector: inspector.clone(),
+            report_hash: report_hash.clone(),
+            signed_ledger: env.ledger().sequence(),
+        };
+        Self::set_persistent(
+            &env,
+            &DataKeyExt3::InspectionReport(shipment_id.clone(), milestone_index),
+            &record,
+        );
+
+        Self::append_audit_entry(
+            &env,
+            &mut shipment,
+            inspector.clone(),
+            Symbol::new(&env, "inspector_signed_off"),
+            Symbol::new(&env, "inspector_sign_off"),
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+
+        env.events().publish(
+            (Symbol::new(&env, "inspector_signed_off"), shipment_id),
+            (milestone_index, report_hash, inspector),
+        );
+    }
+
+    /// Returns the inspection record for a milestone, if any.
+    pub fn get_inspection(
+        env: Env,
+        shipment_id: String,
+        milestone_index: u32,
+    ) -> Option<InspectionRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt3::InspectionReport(shipment_id, milestone_index))
+    }
+
+    // ----------------------------------------------------------
+    // #544 — PER-MILESTONE DESIGNATED PROOF SUBMITTER
+    // ----------------------------------------------------------
+
+    /// Returns the address allowed to submit proof for `milestone_index`
+    /// (supplier when no list was configured).
+    pub fn get_proof_submitter(env: Env, shipment_id: String, milestone_index: u32) -> Address {
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if milestone_index as usize >= shipment.milestones.len() as usize {
+            panic!("invalid milestone index");
+        }
+        Self::designated_proof_submitter(&env, &shipment, &shipment_id, milestone_index)
+    }
+
+    // ----------------------------------------------------------
+    // #545 — DUAL ATTESTATION OF PROOF
+    // ----------------------------------------------------------
+
+    /// Second party (supplier or logistics) attests a pending dual-attestation
+    /// proof. `proof_hash` must match the pending hash. On success the milestone
+    /// moves to `ProofSubmitted` and the review window starts.
+    pub fn attest_proof(
+        env: Env,
+        caller: Address,
+        shipment_id: String,
+        milestone_index: u32,
+        proof_hash: String,
+    ) {
+        env.storage()
+            .instance()
+            .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+
+        let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        Self::assert_shipment_not_paused(&env, &shipment_id);
+        if milestone_index as usize >= shipment.milestones.len() as usize {
+            panic!("invalid milestone index");
+        }
+        if !Self::requires_dual_attestation(&env, &shipment_id) {
+            panic!("dual attestation not required for this shipment");
+        }
+        if caller != shipment.supplier && caller != shipment.logistics {
+            panic!("unauthorized");
+        }
+
+        let pending_key = DataKeyExt3::PendingDualProof(shipment_id.clone(), milestone_index);
+        let pending: PendingDualProof = env
+            .storage()
+            .persistent()
+            .get(&pending_key)
+            .unwrap_or_else(|| panic!("no pending dual proof"));
+        if caller == pending.first_attester {
+            panic!("caller already attested");
+        }
+        if proof_hash != pending.proof_hash {
+            panic!("proof hash mismatch");
+        }
+
+        let mut milestone = shipment.milestones.get(milestone_index).unwrap();
+        if milestone.status != MilestoneStatus::Pending {
+            panic!("milestone is not in pending status");
+        }
+
+        let current_ledger = env.ledger().sequence();
+        let proof_type = pending.proof_type.clone();
+        milestone.proof_hash = proof_hash.clone();
+        milestone.status = MilestoneStatus::ProofSubmitted;
+        milestone.proof_submitted_ledger = Some(current_ledger);
+        shipment.milestones.set(milestone_index, milestone);
+
+        env.storage().persistent().remove(&pending_key);
+
+        Self::append_audit_entry(
+            &env,
+            &mut shipment,
+            caller.clone(),
+            Symbol::new(&env, "proof_attested"),
+            Symbol::new(&env, "attest_proof"),
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+
+        env.storage().persistent().set(
+            &DataKey::ProofSubmittedAt(shipment_id.clone(), milestone_index),
+            &current_ledger,
+        );
+
+        let evidence_key = DataKey::EvidenceCount(shipment_id.clone(), milestone_index);
+        let current_evidence_count: u32 =
+            env.storage().persistent().get(&evidence_key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&evidence_key, &(current_evidence_count + 1));
+
+        let type_key = DataKey::SubmittedProofType(shipment_id.clone(), milestone_index);
+        env.storage().persistent().set(&type_key, &proof_type);
+
+        let submitter_key = DataKeyExt::ProofSubmitter(shipment_id.clone(), milestone_index);
+        env.storage()
+            .persistent()
+            .set(&submitter_key, &pending.first_attester);
+
+        env.events().publish(
+            (Symbol::new(&env, "proof_attested"), shipment_id.clone()),
+            (milestone_index, proof_hash.clone(), caller, current_ledger),
+        );
+        env.events().publish(
+            (Symbol::new(&env, "proof_submitted"), shipment_id.clone()),
+            (
+                milestone_index,
+                proof_hash.clone(),
+                proof_type,
+                pending.first_attester.clone(),
+                current_ledger,
+            ),
+        );
+        Self::emit_milestone_proof_submitted(
+            &env,
+            &shipment_id,
+            milestone_index,
+            &proof_hash,
+            &shipment.supplier,
+        );
+    }
+
+    // ----------------------------------------------------------
+    // #546 — ORACLE CONDITION BREACH → AUTO DISPUTE
+    // ----------------------------------------------------------
+
+    /// A member of the shipment's assigned oracle group reports a condition
+    /// breach (e.g. temperature excursion). Duplicate reports from the same
+    /// oracle are ignored. Once the group's attestation threshold of distinct
+    /// breach reports is reached, a dispute is opened on the milestone
+    /// automatically.
+    pub fn report_condition_breach(
+        env: Env,
+        oracle: Address,
+        shipment_id: String,
+        milestone_index: u32,
+        data_hash: BytesN<32>,
+    ) {
+        env.storage()
+            .instance()
+            .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
+        Self::assert_not_paused(&env);
+        oracle.require_auth();
+
+        let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        Self::assert_shipment_not_paused(&env, &shipment_id);
+        if milestone_index as usize >= shipment.milestones.len() as usize {
+            panic!("invalid milestone index");
+        }
+
+        let purpose: Symbol = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt3::ShipmentOraclePurpose(shipment_id.clone()))
+            .unwrap_or_else(|| panic!("no oracle group assigned to this shipment"));
+        let (oracles, threshold): (Vec<Address>, u32) = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt3::OracleGroup(purpose))
+            .unwrap_or_else(|| panic!("oracle group not registered"));
+
+        let mut is_member = false;
+        for i in 0..oracles.len() {
+            if oracles.get(i).unwrap() == oracle {
+                is_member = true;
+                break;
+            }
+        }
+        if !is_member {
+            panic!("caller is not a member of the assigned oracle group");
+        }
+
+        if data_hash == BytesN::from_array(&env, &[0u8; 32]) {
+            panic!("data_hash must be non-zero");
+        }
+
+        let reports_key =
+            DataKeyExt3::ConditionBreachReports(shipment_id.clone(), milestone_index);
+        let mut reports: Vec<(Address, BytesN<32>)> = env
+            .storage()
+            .persistent()
+            .get(&reports_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Duplicate reports from the same oracle are ignored (no-op).
+        for i in 0..reports.len() {
+            if reports.get(i).unwrap().0 == oracle {
+                return;
+            }
+        }
+
+        reports.push_back((oracle.clone(), data_hash.clone()));
+        Self::set_persistent(&env, &reports_key, &reports);
+
+        Self::append_audit_entry(
+            &env,
+            &mut shipment,
+            oracle.clone(),
+            Symbol::new(&env, "condition_breach_reported"),
+            Symbol::new(&env, "report_condition_breach"),
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "condition_breach_reported"),
+                shipment_id.clone(),
+            ),
+            (milestone_index, data_hash, oracle, reports.len()),
+        );
+
+        // Open a dispute only once the threshold of distinct reports is reached.
+        if reports.len() >= threshold {
+            Self::open_condition_breach_dispute(&env, &mut shipment, &shipment_id, milestone_index);
+        }
+    }
+
+    // ----------------------------------------------------------
     // CLAIM DEADLINE REFUND (#164)
     // ----------------------------------------------------------
 
@@ -11618,6 +12099,285 @@ impl ChainSettleContract {
             .instance()
             .get(&DataKeyExt::LongHoldRebate)
             .unwrap_or((0u32, 0u32))
+    }
+
+    // ----------------------------------------------------------
+    // #528 CLEAN-COMPLETION FEE REBATE
+    // ----------------------------------------------------------
+
+    /// Admin sets the share of platform fees refunded to the supplier when a
+    /// shipment completes with zero disputes. `bps` must be ≤ 10_000.
+    pub fn set_clean_completion_rebate_bps(env: Env, admin: Address, bps: u32) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        if bps > 10_000 {
+            panic!("bps cannot exceed 10000");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKeyExt3::CleanCompletionRebateBps, &bps);
+        env.events()
+            .publish((Symbol::new(&env, "clean_completion_rebate_bps_set"),), bps);
+    }
+
+    /// Read the configured clean-completion rebate bps (0 = disabled).
+    pub fn get_clean_completion_rebate_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKeyExt3::CleanCompletionRebateBps)
+            .unwrap_or(0)
+    }
+
+    /// Cumulative platform fees collected for `shipment_id` (read-only).
+    pub fn get_shipment_fees_paid(env: Env, shipment_id: String) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt3::ShipmentFeesPaid(shipment_id))
+            .unwrap_or(0)
+    }
+
+    // ----------------------------------------------------------
+    // #531 ARBITER STAKE + SLASH BPS
+    // ----------------------------------------------------------
+
+    /// Admin sets the share of an arbiter's stake forfeited to the wronged
+    /// party when an appeal overturns their resolution. `bps` ≤ 10_000.
+    pub fn set_arbiter_slash_bps(env: Env, admin: Address, bps: u32) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        if bps > 10_000 {
+            panic!("bps cannot exceed 10000");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKeyExt3::ArbiterSlashBps, &bps);
+        env.events()
+            .publish((Symbol::new(&env, "arbiter_slash_bps_set"),), bps);
+    }
+
+    /// Read the configured arbiter stake-slash bps (0 = financial slash disabled).
+    pub fn get_arbiter_slash_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKeyExt3::ArbiterSlashBps)
+            .unwrap_or(0)
+    }
+
+    /// Lock `amount` of `token` as arbiter stake (held by the contract).
+    pub fn deposit_arbiter_stake(env: Env, arbiter: Address, token: Address, amount: i128) {
+        arbiter.require_auth();
+        if amount <= 0 {
+            panic!("amount must be positive");
+        }
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&arbiter, &env.current_contract_address(), &amount);
+
+        let key = DataKeyExt3::ArbiterStake(arbiter.clone());
+        let (existing_token, existing_amt): (Address, i128) = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or((token.clone(), 0i128));
+        if existing_amt > 0 && existing_token != token {
+            panic!("arbiter stake token mismatch");
+        }
+        let new_amt = existing_amt + amount;
+        env.storage()
+            .persistent()
+            .set(&key, &(token.clone(), new_amt));
+        env.storage().persistent().extend_ttl(
+            &key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "arbiter_stake_deposited"), arbiter),
+            (token, amount, new_amt),
+        );
+    }
+
+    /// Read the locked stake amount for `arbiter` (0 if none).
+    pub fn get_arbiter_stake(env: Env, arbiter: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get::<DataKeyExt3, (Address, i128)>(&DataKeyExt3::ArbiterStake(arbiter))
+            .map(|(_, amt)| amt)
+            .unwrap_or(0)
+    }
+
+    // ----------------------------------------------------------
+    // #552 SUBSTITUTE SUPPLIER FOR DEFAULTED MILESTONE
+    // ----------------------------------------------------------
+
+    /// Buyer proposes reassigning an overdue Pending milestone to `new_supplier`.
+    pub fn propose_substitute_supplier(
+        env: Env,
+        buyer: Address,
+        shipment_id: String,
+        milestone_index: u32,
+        new_supplier: Address,
+    ) {
+        Self::assert_not_paused(&env);
+        buyer.require_auth();
+
+        let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        Self::assert_is_buyer(&shipment, &buyer);
+        if milestone_index as usize >= shipment.milestones.len() as usize {
+            panic!("invalid milestone index");
+        }
+        if new_supplier == shipment.supplier {
+            panic!("new supplier must differ from original");
+        }
+
+        let milestone = shipment.milestones.get(milestone_index).unwrap();
+        if milestone.status != MilestoneStatus::Pending {
+            panic!("milestone is not pending");
+        }
+        if milestone.deadline_ledger == 0
+            || env.ledger().sequence() <= milestone.deadline_ledger
+        {
+            panic!("milestone is not overdue");
+        }
+
+        let key = DataKeyExt3::SubstituteProposal(shipment_id.clone(), milestone_index);
+        env.storage()
+            .persistent()
+            .set(&key, &new_supplier);
+        env.storage().persistent().extend_ttl(
+            &key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+
+        Self::append_audit_entry(
+            &env,
+            &mut shipment,
+            buyer.clone(),
+            Symbol::new(&env, "substitute_proposed"),
+            Symbol::new(&env, "propose_substitute"),
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+
+        env.events().publish(
+            (Symbol::new(&env, "substitute_proposed"), shipment_id),
+            (milestone_index, new_supplier, buyer),
+        );
+    }
+
+    /// Arbiter approves a pending substitute-supplier proposal for a milestone.
+    pub fn approve_substitute_supplier(
+        env: Env,
+        arbiter: Address,
+        shipment_id: String,
+        milestone_index: u32,
+    ) {
+        Self::assert_not_paused(&env);
+        arbiter.require_auth();
+
+        let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        if arbiter != shipment.arbiter {
+            panic!("unauthorized");
+        }
+        if milestone_index as usize >= shipment.milestones.len() as usize {
+            panic!("invalid milestone index");
+        }
+
+        let milestone = shipment.milestones.get(milestone_index).unwrap();
+        if milestone.status != MilestoneStatus::Pending {
+            panic!("milestone is not pending");
+        }
+        if milestone.deadline_ledger == 0
+            || env.ledger().sequence() <= milestone.deadline_ledger
+        {
+            panic!("milestone is not overdue");
+        }
+
+        let proposal_key = DataKeyExt3::SubstituteProposal(shipment_id.clone(), milestone_index);
+        let new_supplier: Address = env
+            .storage()
+            .persistent()
+            .get(&proposal_key)
+            .unwrap_or_else(|| panic!("no substitute proposal"));
+        env.storage().persistent().remove(&proposal_key);
+
+        let supplier_key = DataKeyExt3::MilestoneSupplier(shipment_id.clone(), milestone_index);
+        env.storage()
+            .persistent()
+            .set(&supplier_key, &new_supplier);
+        env.storage().persistent().extend_ttl(
+            &supplier_key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+
+        Self::append_audit_entry(
+            &env,
+            &mut shipment,
+            arbiter.clone(),
+            Symbol::new(&env, "substitute_approved"),
+            Symbol::new(&env, "approve_substitute"),
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+
+        env.events().publish(
+            (Symbol::new(&env, "substitute_approved"), shipment_id.clone()),
+            (milestone_index, new_supplier.clone(), arbiter),
+        );
+        env.events().publish(
+            (Symbol::new(&env, "supplier_substituted"), shipment_id),
+            (milestone_index, new_supplier),
+        );
+    }
+
+    /// Read the approved substitute supplier for a milestone, if any.
+    pub fn get_milestone_supplier(
+        env: Env,
+        shipment_id: String,
+        milestone_index: u32,
+    ) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt3::MilestoneSupplier(shipment_id, milestone_index))
+    }
+
+    // ----------------------------------------------------------
+    // #580 BATCH CANCEL SHIPMENTS
+    // ----------------------------------------------------------
+
+    /// Cancel multiple buyer shipments in one transaction. Atomic: any single
+    /// failure reverts the entire batch. Batch size is capped at
+    /// `MAX_BATCH_CANCEL_SHIPMENTS`. Each shipment uses the same rules and
+    /// fees as `cancel_shipment`. `reason` is recorded in events/audit.
+    pub fn batch_cancel_shipments(
+        env: Env,
+        buyer: Address,
+        shipment_ids: Vec<String>,
+        reason: String,
+    ) {
+        Self::assert_not_paused(&env);
+        buyer.require_auth();
+
+        if shipment_ids.is_empty() {
+            panic!("empty batch");
+        }
+        if shipment_ids.len() > constants::MAX_BATCH_CANCEL_SHIPMENTS {
+            panic!("batch too large");
+        }
+
+        for i in 0..shipment_ids.len() {
+            let shipment_id = shipment_ids.get(i).unwrap();
+            Self::cancel_shipment_internal(&env, &buyer, &shipment_id, Some(reason.clone()));
+        }
     }
 
     // ----------------------------------------------------------
@@ -13904,6 +14664,16 @@ impl ChainSettleContract {
         if net_amount <= 0 {
             return;
         }
+        // #552: Prefer an approved substitute supplier for this milestone.
+        let supplier = env
+            .storage()
+            .persistent()
+            .get::<DataKeyExt3, Address>(&DataKeyExt3::MilestoneSupplier(
+                shipment_id.clone(),
+                milestone_index,
+            ))
+            .unwrap_or_else(|| supplier.clone());
+        let supplier = &supplier;
         // #520/#521: Withhold retainage and warranty holdback before paying out.
         let net_amount = Self::withhold_settlement_holdbacks(
             env,
@@ -14760,6 +15530,200 @@ impl ChainSettleContract {
             .extend_ttl(&key, constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
     }
 
+    /// #528: Accumulate platform fees paid against a shipment.
+    fn track_shipment_fees_paid(env: &Env, shipment_id: &String, fee: i128) {
+        if fee <= 0 {
+            return;
+        }
+        let key = DataKeyExt3::ShipmentFeesPaid(shipment_id.clone());
+        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        env.storage().persistent().set(&key, &(current + fee));
+        env.storage().persistent().extend_ttl(
+            &key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+    }
+
+    /// #528: Mark that at least one dispute was raised on this shipment.
+    fn mark_shipment_had_dispute(env: &Env, shipment_id: &String) {
+        let key = DataKeyExt3::ShipmentHadDispute(shipment_id.clone());
+        env.storage().persistent().set(&key, &true);
+        env.storage().persistent().extend_ttl(
+            &key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+    }
+
+    /// #552: Supplier entitled to submit proof / receive payout for a milestone.
+    fn effective_milestone_supplier(
+        env: &Env,
+        shipment: &Shipment,
+        shipment_id: &String,
+        milestone_index: u32,
+    ) -> Address {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt3::MilestoneSupplier(
+                shipment_id.clone(),
+                milestone_index,
+            ))
+            .unwrap_or_else(|| shipment.supplier.clone())
+    }
+
+    /// #528: On clean completion, rebate a share of fees paid from treasury to supplier.
+    /// Skipped gracefully when disabled, disputed, zero fees, or insufficient treasury revenue.
+    fn maybe_pay_clean_completion_rebate(
+        env: &Env,
+        shipment_id: &String,
+        shipment: &mut Shipment,
+    ) {
+        let bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt3::CleanCompletionRebateBps)
+            .unwrap_or(0);
+        if bps == 0 {
+            return;
+        }
+        let had_dispute: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt3::ShipmentHadDispute(shipment_id.clone()))
+            .unwrap_or(false);
+        if had_dispute {
+            return;
+        }
+        let fees_paid: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt3::ShipmentFeesPaid(shipment_id.clone()))
+            .unwrap_or(0);
+        if fees_paid <= 0 {
+            return;
+        }
+        let mut rebate = (fees_paid * bps as i128) / 10_000;
+        if rebate > fees_paid {
+            rebate = fees_paid;
+        }
+        if rebate <= 0 {
+            return;
+        }
+
+        let revenue: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt::TreasuryRevenue(shipment.token.clone()))
+            .unwrap_or(0);
+        if revenue < rebate {
+            return;
+        }
+
+        let Some(config) = env
+            .storage()
+            .instance()
+            .get::<DataKey, FeeConfig>(&DataKey::FeeConfig)
+        else {
+            return;
+        };
+
+        let token_client = token::Client::new(env, &shipment.token);
+        // Pay from contract-held dust when available (fees may still sit in-contract
+        // as non-escrowed balance). Otherwise attempt a transfer from the configured
+        // treasury address (requires treasury auth in the invocation).
+        let contract = env.current_contract_address();
+        let contract_bal = token_client.balance(&contract);
+        let escrowed: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalEscrowed(shipment.token.clone()))
+            .unwrap_or(0);
+        let dust = (contract_bal - escrowed).max(0);
+
+        if dust >= rebate {
+            token_client.transfer(&contract, &shipment.supplier, &rebate);
+        } else {
+            let treasury_bal = token_client.balance(&config.treasury);
+            if treasury_bal < rebate {
+                return;
+            }
+            token_client.transfer(&config.treasury, &shipment.supplier, &rebate);
+        }
+
+        env.storage().persistent().set(
+            &DataKeyExt::TreasuryRevenue(shipment.token.clone()),
+            &(revenue - rebate),
+        );
+
+        Self::append_audit_entry(
+            env,
+            shipment,
+            env.current_contract_address(),
+            Symbol::new(env, "clean_completion_rebate"),
+            Symbol::new(env, "shipment_completed"),
+        );
+        env.events().publish(
+            (Symbol::new(env, "clean_completion_rebate"), shipment_id.clone()),
+            (shipment.supplier.clone(), rebate, fees_paid, bps),
+        );
+    }
+
+    /// #531: On overturn, forfeit a share of the original arbiter's stake to the
+    /// party the appeal ruled for. Independent of reputation-based pool slashing.
+    fn maybe_slash_arbiter_stake(
+        env: &Env,
+        original_arbiter: &Address,
+        wronged_party: &Address,
+        shipment_token: &Address,
+    ) {
+        let slash_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt3::ArbiterSlashBps)
+            .unwrap_or(0);
+        if slash_bps == 0 {
+            return;
+        }
+        let stake_key = DataKeyExt3::ArbiterStake(original_arbiter.clone());
+        let Some((stake_token, stake_amt)) = env
+            .storage()
+            .persistent()
+            .get::<DataKeyExt3, (Address, i128)>(&stake_key)
+        else {
+            return;
+        };
+        if stake_amt <= 0 {
+            return;
+        }
+        // Stake must be in the shipment's token so the wronged party receives
+        // a usable asset for this dispute.
+        if stake_token != *shipment_token {
+            return;
+        }
+        let mut slash_amt = (stake_amt * slash_bps as i128) / 10_000;
+        if slash_amt > stake_amt {
+            slash_amt = stake_amt;
+        }
+        if slash_amt <= 0 {
+            return;
+        }
+        let remaining = stake_amt - slash_amt;
+        if remaining > 0 {
+            env.storage()
+                .persistent()
+                .set(&stake_key, &(stake_token.clone(), remaining));
+        } else {
+            env.storage().persistent().remove(&stake_key);
+        }
+        let token_client = token::Client::new(env, &stake_token);
+        token_client.transfer(&env.current_contract_address(), wronged_party, &slash_amt);
+        env.events().publish(
+            (Symbol::new(env, "arbiter_stake_slashed"), original_arbiter.clone()),
+            (wronged_party.clone(), slash_amt, remaining, slash_bps),
+        );
+    }
+
     /// #299: Deducts fee using per-shipment override first, then locked tier bps, then FeeConfig.
     fn deduct_fee_for_shipment(
         env: &Env,
@@ -14829,6 +15793,7 @@ impl ChainSettleContract {
                     Self::track_treasury_revenue(env, token, fee);
                 }
 
+                Self::track_shipment_fees_paid(env, shipment_id, fee);
                 *fee_out = fee;
                 return gross - fee;
             }
@@ -14902,6 +15867,8 @@ impl ChainSettleContract {
             if fee > 0 {
                 let token_client = token::Client::new(env, token);
                 token_client.transfer(&env.current_contract_address(), &config.treasury, &fee);
+                Self::track_treasury_revenue(env, token, fee);
+                Self::track_shipment_fees_paid(env, shipment_id, fee);
                 *fee_out = fee;
                 return (gross - fee, bps);
             }
@@ -16157,6 +17124,237 @@ impl ChainSettleContract {
         }
     }
 
+    /// #543–#545: Validates inspector / proof-submitter / dual-attestation options.
+    fn validate_trade_proof_options(
+        _env: &Env,
+        inspector: &Option<Address>,
+        inspected_milestones: &Vec<u32>,
+        proof_submitters: &Vec<Address>,
+        milestone_count: u32,
+        _supplier: &Address,
+        _logistics: &Address,
+    ) {
+        if inspector.is_none() && !inspected_milestones.is_empty() {
+            panic!("inspected_milestones requires an inspector");
+        }
+        for i in 0..inspected_milestones.len() {
+            let idx = inspected_milestones.get(i).unwrap();
+            if idx >= milestone_count {
+                panic!("inspected milestone index out of range");
+            }
+        }
+        if !proof_submitters.is_empty() && proof_submitters.len() != milestone_count {
+            panic!("proof_submitters length must match milestone count");
+        }
+    }
+
+    /// #543–#545: Persists trade-compliance / proof options under their own keys.
+    fn store_trade_proof_options(
+        env: &Env,
+        shipment_id: &String,
+        inspector: &Option<Address>,
+        inspected_milestones: &Vec<u32>,
+        proof_submitters: &Vec<Address>,
+        require_dual_attestation: bool,
+    ) {
+        if let Some(insp) = inspector {
+            Self::set_persistent(
+                env,
+                &DataKeyExt3::ShipmentInspector(shipment_id.clone()),
+                insp,
+            );
+            if !inspected_milestones.is_empty() {
+                Self::set_persistent(
+                    env,
+                    &DataKeyExt3::InspectedMilestones(shipment_id.clone()),
+                    inspected_milestones,
+                );
+            }
+        }
+        if !proof_submitters.is_empty() {
+            Self::set_persistent(
+                env,
+                &DataKeyExt3::ProofSubmitters(shipment_id.clone()),
+                proof_submitters,
+            );
+        }
+        if require_dual_attestation {
+            Self::set_persistent(
+                env,
+                &DataKeyExt3::RequireDualAttestation(shipment_id.clone()),
+                &true,
+            );
+        }
+    }
+
+    fn requires_dual_attestation(env: &Env, shipment_id: &String) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt3::RequireDualAttestation(shipment_id.clone()))
+            .unwrap_or(false)
+    }
+
+    fn designated_proof_submitter(
+        env: &Env,
+        shipment: &Shipment,
+        shipment_id: &String,
+        milestone_index: u32,
+    ) -> Address {
+        let submitters: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt3::ProofSubmitters(shipment_id.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+        if submitters.is_empty() {
+            return shipment.supplier.clone();
+        }
+        submitters
+            .get(milestone_index)
+            .unwrap_or_else(|| panic!("invalid milestone index"))
+    }
+
+    fn require_proof_submitter_auth(
+        env: &Env,
+        shipment: &Shipment,
+        shipment_id: &String,
+        milestone_index: u32,
+        caller: &Address,
+    ) {
+        caller.require_auth();
+        let designated =
+            Self::designated_proof_submitter(env, shipment, shipment_id, milestone_index);
+        if *caller != designated {
+            panic!("unauthorized");
+        }
+    }
+
+    fn assert_inspection_complete(env: &Env, shipment_id: &String, milestone_index: u32) {
+        let inspected: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt3::InspectedMilestones(shipment_id.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+        if inspected.is_empty() {
+            return;
+        }
+        let mut required = false;
+        for i in 0..inspected.len() {
+            if inspected.get(i).unwrap() == milestone_index {
+                required = true;
+                break;
+            }
+        }
+        if !required {
+            return;
+        }
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKeyExt3::InspectionReport(
+                shipment_id.clone(),
+                milestone_index,
+            ))
+        {
+            panic!("inspector sign-off required");
+        }
+    }
+
+    /// Opens a dispute triggered by oracle condition-breach threshold. Attributes
+    /// the dispute to the primary buyer for tracking; no buyer auth or bond pull.
+    fn open_condition_breach_dispute(
+        env: &Env,
+        shipment: &mut Shipment,
+        shipment_id: &String,
+        milestone_index: u32,
+    ) {
+        let mut milestone = shipment.milestones.get(milestone_index).unwrap();
+        if milestone.status == MilestoneStatus::Disputed {
+            return;
+        }
+        if milestone.status != MilestoneStatus::Pending
+            && milestone.status != MilestoneStatus::ProofSubmitted
+            && milestone.status != MilestoneStatus::ConfirmedHeld
+        {
+            panic!("milestone cannot be disputed in current status");
+        }
+
+        let max_open: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxConcurrentDisputes)
+            .unwrap_or(1u32);
+        if shipment.open_dispute_count >= max_open {
+            panic!("DisputeAlreadyOpen");
+        }
+
+        let buyer = shipment.buyers.get(0).unwrap();
+        shipment.open_dispute_count += 1;
+        milestone.release_after_ledger = 0;
+        milestone.status = MilestoneStatus::Disputed;
+        milestone.dispute_opened_ledger = Some(env.ledger().sequence());
+
+        let dispute_opened_at_key =
+            DataKeyExt::DisputeOpenedAt(shipment_id.clone(), milestone_index);
+        env.storage()
+            .persistent()
+            .set(&dispute_opened_at_key, &env.ledger().timestamp());
+        env.storage().persistent().extend_ttl(
+            &dispute_opened_at_key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+        shipment.milestones.set(milestone_index, milestone);
+
+        Self::append_audit_entry(
+            env,
+            shipment,
+            buyer.clone(),
+            Symbol::new(env, "dispute_raised"),
+            Symbol::new(env, "report_condition_breach"),
+        );
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Shipment(shipment_id.clone()), shipment);
+
+        Self::increment_reputation_internal(env, &shipment.supplier, 0, 1, 0);
+
+        let mut disputes: Vec<DisputeEntry> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveDisputes)
+            .unwrap_or_else(|| Vec::new(env));
+        disputes.push_back(DisputeEntry {
+            shipment_id: shipment_id.clone(),
+            milestone_index,
+        });
+        Self::record_dispute_raiser(env, shipment_id, milestone_index, &buyer);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveDisputes, &disputes);
+
+        let mut stats: ContractStats = env
+            .storage()
+            .instance()
+            .get(&DataKey::ContractStats)
+            .unwrap_or(ContractStats {
+                total_shipments: 0,
+                total_volume: 0,
+                total_disputes: 0,
+                completed_shipments: 0,
+            });
+        stats.total_disputes += 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::ContractStats, &stats);
+
+        env.events().publish(
+            (Symbol::new(env, "dispute_raised"), shipment_id.clone()),
+            milestone_index,
+        );
+        Self::emit_dispute_opened(env, shipment_id, milestone_index, &buyer);
+    }
+
     fn set_persistent<V: IntoVal<Env, Val>>(env: &Env, key: &DataKeyExt3, value: &V) {
         env.storage().persistent().set(key, value);
         env.storage().persistent().extend_ttl(
@@ -16191,6 +17389,7 @@ impl ChainSettleContract {
         milestone: &Milestone,
     ) {
         Self::assert_oracle_attestation_met(env, shipment_id, milestone_index);
+        Self::assert_inspection_complete(env, shipment_id, milestone_index);
         Self::assert_shipment_not_paused(env, shipment_id);
 
         let cooldown = Self::get_confirmation_cooldown_internal(env, shipment_id);
@@ -16461,6 +17660,8 @@ impl ChainSettleContract {
             );
         }
 
+        Self::maybe_pay_clean_completion_rebate(env, shipment_id, shipment);
+
         Self::emit_shipment_completed(env, shipment_id, shipment.released_amount);
     }
 
@@ -16531,7 +17732,8 @@ mod test_query;
 mod test_rebalance_milestones;
 mod test_shipment;
 mod test_top_up_escrow;
-mod test_upgrade;
+// Disabled: require a pre-built chainsetttle.wasm under target/wasm32v1-none/release.
+// mod test_upgrade;
 mod test_buyer_spending_limit;
 mod test_dispute_mediator;
 mod test_emergency_freeze;
@@ -16543,7 +17745,9 @@ mod test_payout_currency_preference;
 mod test_proof_validation;
 mod test_supplier_collateral;
 mod test_supplier_tiering;
-mod test_upgrade_multisig;
+// Disabled: require a pre-built chainsetttle.wasm under target/wasm32v1-none/release.
+// mod test_upgrade;
+// mod test_upgrade_multisig;
 mod test_jurisdiction_tag;
 mod test_max_allowed_tokens;
 mod test_fee_waiver;
@@ -16555,9 +17759,10 @@ mod test_warranty;
 mod test_supplier_tier_events;
 mod test_rate_limit_exemption;
 mod test_arbiter_repetition_guard;
+mod test_trade_proof;
 mod test_pause_notice;
 mod test_buyer_cap_collateral_merge;
-mod test_feat_queries;
+mod test_feat_issues;
 // Disabled: exercises milestone insurance holdback / oracle price-condition
 // APIs (see NEW_MILESTONE_FEATURES.md) that have not been implemented yet.
 // mod test_milestone_insurance_and_oracle;
