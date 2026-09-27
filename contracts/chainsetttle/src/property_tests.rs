@@ -341,8 +341,12 @@ mod contract_prop_tests {
                 retainage_bps: 0,
                 warranty_bps: 0,
                 warranty_ledgers: 0,
+                inspector: None,
+                inspected_milestones: vec![env],
+                proof_submitters: vec![env],
+                require_dual_attestation: false,
                 fund_from_vault: false,
-                },
+            },
         );
     }
 
@@ -655,8 +659,12 @@ mod milestone_percent_fuzz {
                 retainage_bps: 0,
                 warranty_bps: 0,
                 warranty_ledgers: 0,
+                inspector: None,
+                inspected_milestones: vec![env],
+                proof_submitters: vec![env],
+                require_dual_attestation: false,
                 fund_from_vault: false,
-                }
+            }
         }
 
         fn milestone(env: &Env, name: &str, pct: u32) -> Milestone {

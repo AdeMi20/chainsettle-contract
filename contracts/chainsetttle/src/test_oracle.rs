@@ -151,8 +151,12 @@ fn default_options(env: &Env) -> ShipmentOptions {
         retainage_bps: 0,
         warranty_bps: 0,
         warranty_ledgers: 0,
+        inspector: None,
+        inspected_milestones: Vec::new(env),
+        proof_submitters: Vec::new(env),
+        require_dual_attestation: false,
         fund_from_vault: false,
-        }
+    }
 }
 
 // ============================================================

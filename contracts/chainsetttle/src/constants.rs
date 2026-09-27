@@ -35,6 +35,9 @@ pub const DEFAULT_MAX_MILESTONE_COUNT: u32 = 50;
 /// admin has not configured an override. 8000 = 80%.
 pub const DEFAULT_EMERGENCY_FREEZE_SUPERMAJORITY_BPS: u32 = 8_000;
 
+/// Max shipments accepted by `batch_cancel_shipments` (#580) in one call.
+pub const MAX_BATCH_CANCEL_SHIPMENTS: u32 = 20;
+
 /// Maximum basis points a shipment creator may configure for a value-scaled
 /// dispute bond (#391) when the admin has not set a stricter cap via
 /// `set_max_dispute_bond_bps`. 2000 = 20% of shipment value.
@@ -62,3 +65,13 @@ pub const MAX_RETAINAGE_BPS: u32 = 2_000;
 
 /// Maximum warranty holdback a shipment may withhold from each milestone payment (#521).
 pub const MAX_WARRANTY_BPS: u32 = 2_000;
+
+/// Semantic contract version — must match `contracts/chainsetttle/Cargo.toml`.
+/// #571
+pub const VERSION_MAJOR: u32 = 0;
+pub const VERSION_MINOR: u32 = 1;
+pub const VERSION_PATCH: u32 = 0;
+
+/// Storage schema version written by `migrate` (#571). Bump when persistent
+/// layout changes require a post-upgrade migration.
+pub const STORAGE_SCHEMA_VERSION: u32 = 1;

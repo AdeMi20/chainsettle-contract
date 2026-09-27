@@ -706,6 +706,60 @@ stellar contract invoke \
   --address <ADDRESS>
 ```
 
+`get_shipments_by_arbiter(arbiter, cursor, limit) → Vec<String>` (read-only) — #572
+
+Returns a page of shipment IDs currently assigned to `arbiter`. The index is updated on creation, arbiter rotation, appeal reassignment, recusal, and backup activation. Removing an arbiter from a shipment also removes that shipment from their index. Pagination uses a 0-based `cursor` into the index and clamps `limit` to `LIST_SHIPMENTS_MAX_PAGE` (50).
+
+```bash
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --network testnet \
+  -- get_shipments_by_arbiter \
+  --arbiter <ARBITER_ADDRESS> \
+  --cursor null \
+  --limit 20
+```
+
+`get_shipments_by_logistics(logistics, cursor, limit) → Vec<String>` (read-only) — #573
+
+Returns a page of shipment IDs involving `logistics`. The index is maintained on creation and on `transfer_logistics`. Archived shipments remain listed (same behaviour as the buyer/supplier indexes).
+
+```bash
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --network testnet \
+  -- get_shipments_by_logistics \
+  --logistics <LOGISTICS_ADDRESS> \
+  --cursor null \
+  --limit 20
+```
+
+`transfer_logistics(current_logistics, shipment_id, new_logistics)` — #573
+
+Transfers the logistics provider role. Requires auth from both the current and new logistics addresses. Updates the logistics shipment index accordingly. Blocked while any milestone is disputed.
+
+`get_upcoming_deadlines(address, within_ledgers, limit) → Vec<(String, u32, u32)>` (read-only) — #574
+
+Returns upcoming milestone deadlines for shipments where `address` is buyer or supplier. Each entry is `(shipment_id, milestone_index, deadline_ledger)`. Only `Pending` / `ProofSubmitted` milestones on `Active` shipments whose effective deadline falls in `(now, now + within_ledgers]` are included. Results are sorted by deadline ascending and capped at `limit` (clamped to 50).
+
+```bash
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --network testnet \
+  -- get_upcoming_deadlines \
+  --address <ADDRESS> \
+  --within_ledgers 1000 \
+  --limit 20
+```
+
+`version() → (u32, u32, u32)` (read-only) — #571
+
+Returns the semantic contract version `(major, minor, patch)` sourced from constants that match `contracts/chainsetttle/Cargo.toml`. No authorization required.
+
+`storage_schema_version() → u32` (read-only) — #571
+
+Returns the instance-stored storage schema version written by `migrate`. Returns `0` until `migrate` has been called after an upgrade. No authorization required.
+
 `get_contract_stats() → ContractStats` (read-only)
 
 Returns contract-level aggregate statistics. No authorization is required. All counters default to `0` if no shipments have been created yet.
@@ -1928,8 +1982,9 @@ When multi-admin governance is enabled, upgrades must be proposed and approved b
 Post-upgrade state migration entrypoint.
 
 - **Who can call:** Public / post-upgrade execution hook.
-- **What it does post-upgrade:** Called once immediately after a WASM bytecode upgrade to execute state schema transformations, re-key storage entries (e.g. migrating `V1_*` storage keys to `V2_*` schema), or set new storage defaults.
-- **Idempotency:** Designed to be safe to invoke post-upgrade without side-effects when no data model changes are required (currently operates as an idempotent stub for the active contract version).
+- **What it does post-upgrade:** Called once immediately after a WASM bytecode upgrade to execute state schema transformations, re-key storage entries (e.g. migrating `V1_*` storage keys to `V2_*` schema), or set new storage defaults. As of #571 it also writes `StorageSchemaVersion` (currently `1`, matching `constants::STORAGE_SCHEMA_VERSION`) so integrators can read it via `storage_schema_version()`.
+- **Release process:** When shipping a release that changes on-disk layout, bump `version` in `contracts/chainsetttle/Cargo.toml`, keep `VERSION_MAJOR` / `VERSION_MINOR` / `VERSION_PATCH` in sync, bump `STORAGE_SCHEMA_VERSION`, and ensure `migrate` writes the new schema version.
+- **Idempotency:** Safe to re-invoke; repeated calls keep the same schema version when unchanged.
 
 ---
 
@@ -2361,3 +2416,45 @@ Execution fails cleanly when the vault balance is insufficient, the order is not
 - Otherwise identical to `create_shipment` (same shipment shape and wallet refunds)
 
 Tests cover the SAC approve flow, insufficient allowance, and the `from`-must-be-buyer guard.
+
+### Trade Compliance & Proof Controls (#543–#546)
+
+Four optional `ShipmentOptions` fields for inspection, designated proof submitters, dual attestation, and oracle condition-breach disputes. Defaults leave existing behaviour unchanged. Values are validated in `create_shipment` and stored under `DataKeyExt3` keys.
+
+| Option | Type | Validation / default |
+| --- | --- | --- |
+| `inspector` | `Option<Address>` | `None` = no inspector |
+| `inspected_milestones` | `Vec<u32>` | Empty = none. Requires `inspector`. Indices must be in range |
+| `proof_submitters` | `Vec<Address>` | Empty = supplier-only. Non-empty length must match milestones |
+| `require_dual_attestation` | `bool` | `false` = unchanged single-submitter flow |
+
+#### Independent inspector sign-off (#543)
+
+Function | Who | Behaviour
+--- | --- | ---
+`inspector_sign_off(inspector, shipment_id, milestone_index, report_hash)` | Named `inspector` | Stores the report hash for an inspected milestone. Emits `inspector_signed_off` and writes an audit entry.
+`get_inspection(shipment_id, milestone_index)` | Anyone (read-only) | Returns the stored `InspectionRecord`, if any.
+`confirm_milestone` / graded / partial confirm | Buyer | Panics with `inspector sign-off required` for inspected milestones until sign-off exists. Other milestones are unaffected.
+
+#### Per-milestone designated proof submitter (#544)
+
+Function | Who | Behaviour
+--- | --- | ---
+`submit_proof` / `correct_proof` | Designated address | Empty `proof_submitters` → only the supplier. Otherwise only the address at that milestone index.
+`get_proof_submitter(shipment_id, milestone_index)` | Anyone (read-only) | Returns the designated (or default supplier) address.
+
+#### Dual attestation (#545)
+
+When `require_dual_attestation` is true, the first `submit_proof` from the designated submitter (supplier or logistics) stores a pending proof and leaves the milestone `Pending`. The other of supplier/logistics calls `attest_proof(caller, shipment_id, milestone_index, proof_hash)` with a matching hash; only then does the milestone move to `ProofSubmitted` and the review window start. Mismatched hashes are rejected. When disabled, behaviour is unchanged.
+
+Events: `dual_proof_pending`, `proof_attested`, then the usual `proof_submitted`.
+
+#### Oracle condition-breach auto-dispute (#546)
+
+Requires a shipment oracle purpose (`set_shipment_oracle_purpose`) and a registered N-of-M group (`register_oracle_group`). Works alongside existing oracle attestations used for confirmation gating.
+
+Function | Who | Behaviour
+--- | --- | ---
+`report_condition_breach(oracle, shipment_id, milestone_index, data_hash)` | Group member | Records the report, emits `condition_breach_reported`, appends an audit entry. Duplicate reports from the same oracle are ignored. When distinct reports reach the group threshold, a dispute opens automatically on the milestone.
+
+Non-group callers are rejected. Threshold gating ensures a dispute opens only after enough distinct reports.
