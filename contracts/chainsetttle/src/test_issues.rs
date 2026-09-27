@@ -91,7 +91,8 @@ fn default_options(_env: &Env) -> ShipmentOptions {
         retainage_bps: 0,
         warranty_bps: 0,
         warranty_ledgers: 0,
-    }
+        fund_from_vault: false,
+        }
 }
 
 fn single_buyer(env: &Env, buyer: &Address) -> soroban_sdk::Vec<Address> {

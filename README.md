@@ -2311,3 +2311,53 @@ Function | Who | Behaviour
 `get_warranty_balance` / `get_warranty_end_ledger` / `get_warranty_claim` | Anyone (read-only) | Holdback in escrow, the ledger the period ends (`0` = not started), and the open claim.
 
 Events: `warranty_started`, `warranty_claim_filed`, `warranty_claim_resolved`, `warranty_released`. Each has a matching audit-log entry. A shipment cannot be archived while a warranty holdback is still in escrow. Cancelling before completion refunds any withheld warranty to the buyer.
+
+### Tier-based Maximum Shipment Value (#560)
+
+Cap a single shipment's `total_amount` according to the supplier's current reputation tier (Bronze / Silver / Gold). This stacks with the existing global and per-token max shipment value checks.
+
+`SupplierTierConfig` gains three fields (each `0` = unlimited):
+
+| Field | Meaning |
+| --- | --- |
+| `bronze_max_value` | Max shipment value for Bronze suppliers |
+| `silver_max_value` | Max shipment value for Silver suppliers |
+| `gold_max_value` | Max shipment value for Gold suppliers |
+
+When `create_shipment` runs and a tier config is set, the contract derives the supplier's tier and rejects amounts above that tier's cap with `SupplierTierMaxValueExceeded: {Tier} cap={n}`. Upgrading a supplier's tier (via completed shipments) automatically raises the allowed value.
+
+### Buyer Escrow Vault (#561)
+
+Frequent buyers can pre-fund a contract-held vault and create shipments that draw from it.
+
+| Function | Who | Behaviour |
+| --- | --- | --- |
+| `vault_deposit(buyer, token, amount)` | Buyer | Transfers tokens into the vault. Emits `vault_deposited`. |
+| `vault_withdraw(buyer, token, amount)` | Buyer | Withdraws up to the vault balance. Emits `vault_withdrawn`. |
+| `get_vault_balance(buyer, token)` | Anyone | Read-only balance. |
+
+Set `ShipmentOptions.fund_from_vault = true` to debit the primary buyer's vault (including dispute bonds and early-bonus pool) instead of a wallet transfer. Insufficient vault funds panic with `insufficient vault balance`. Refunds on vault-funded shipments (e.g. `cancel_shipment`) are credited back to the vault. `withdraw_treasury_dust` excludes vault balances via `TotalVaulted`.
+
+### Standing Orders (#562)
+
+Register a vault-funded recurring template that anyone can trigger when due.
+
+| Function | Who | Behaviour |
+| --- | --- | --- |
+| `create_standing_order(buyer, params)` | Buyer | Saves the template (`StandingOrderParams`: template name, parties, token, amount, milestones, `interval_ledgers`, `max_occurrences`). Returns `order_id`. |
+| `execute_standing_order(order_id)` | Anyone | When `ledger >= next_ledger` and occurrences remain, creates a vault-funded shipment with deterministic id `so-{order_id}-{occurrence}`, then advances the schedule. |
+| `cancel_standing_order(buyer, order_id)` | Owner | Marks the order cancelled. |
+| `get_standing_order(order_id)` | Anyone | Read-only. |
+
+Execution fails cleanly when the vault balance is insufficient, the order is not due, cancelled, or exhausted.
+
+### Fund Escrow via Token Allowance (#563)
+
+`create_shipment_with_allowance(params: AllowanceShipmentParams)` lets a spender create a shipment on a buyer's behalf using SAC `approve` + `transfer_from`.
+
+- `spender` must `require_auth`
+- `from` must be one of the `buyers`
+- Funding uses `token.transfer_from(spender, from, contract, amount)` (including bonds / early bonus)
+- Otherwise identical to `create_shipment` (same shipment shape and wallet refunds)
+
+Tests cover the SAC approve flow, insufficient allowance, and the `from`-must-be-buyer guard.

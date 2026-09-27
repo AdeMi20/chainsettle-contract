@@ -113,7 +113,8 @@ fn create_and_dispute(
             retainage_bps: 0,
             warranty_bps: 0,
             warranty_ledgers: 0,
-        },
+            fund_from_vault: false,
+            },
     );
     let proof = String::from_str(env, "ipfs://concurrent-proof");
     client.submit_proof(supplier, &id, &0, &proof, &Symbol::new(&env, "ipfs"));

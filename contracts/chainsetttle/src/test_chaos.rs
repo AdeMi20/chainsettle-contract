@@ -165,7 +165,8 @@ fn exec(
                 retainage_bps: 0,
                 warranty_bps: 0,
                 warranty_ledgers: 0,
-            };
+                fund_from_vault: false,
+                };
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 client.create_shipment(
                     &id,

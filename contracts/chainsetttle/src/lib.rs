@@ -444,6 +444,11 @@ pub struct ShipmentOptions {
     /// Ledgers after completion during which the buyer may file a warranty claim.
     /// Must be > 0 when `warranty_bps > 0`.
     pub warranty_ledgers: u32,
+
+    // ── #561 Buyer escrow vault ───────────────────────────────────────────────
+    /// When true, `create_shipment` debits the primary buyer's vault balance
+    /// instead of transferring tokens. Refunds return to the vault.
+    pub fund_from_vault: bool,
 }
 
 /// #521 – Open warranty claim filed by the buyer after shipment completion.
@@ -1407,6 +1412,25 @@ pub enum DataKeyExt3 {
     /// Minimum ledgers required between now and the next milestone deadline
     /// for `request_shipment_pause` to be accepted (absent/0 = no minimum).
     PauseMinNoticeLedgers,
+
+    // ── #561 Buyer escrow vault ───────────────────────────────────────────
+    /// Per-(buyer, token) vault balance held by the contract.
+    VaultBalance(Address, Address),
+    /// Aggregate vault principal per token (excluded from treasury dust).
+    TotalVaulted(Address),
+    /// True when the shipment was funded from the buyer vault (refunds return there).
+    FundFromVault(String),
+
+    // ── #562 Standing orders ──────────────────────────────────────────────
+    /// Recurring shipment template keyed by order id.
+    StandingOrder(u64),
+    /// Monotonic counter for the next standing-order id.
+    NextStandingOrderId,
+    /// Internal one-shot flag: skip buyer require_auth in create_shipment
+    /// (set by allowance / standing-order entry points that already authorised).
+    SkipBuyerAuth,
+    /// Internal one-shot: (spender, from) for allowance-funded create_shipment.
+    PendingAllowance,
 }
 
 /// #517 – Pending proposal to merge two adjacent Pending milestones.
@@ -1455,6 +1479,64 @@ pub struct SupplierTierConfig {
     /// Max (disputed / completed) ratio in basis points to qualify for Gold.
     pub gold_max_disputed_ratio_bps: u32,
     pub gold_multiplier_bps: u32,
+    /// #560: Max single-shipment value for Bronze suppliers (0 = unlimited).
+    pub bronze_max_value: i128,
+    /// #560: Max single-shipment value for Silver suppliers (0 = unlimited).
+    pub silver_max_value: i128,
+    /// #560: Max single-shipment value for Gold suppliers (0 = unlimited).
+    pub gold_max_value: i128,
+}
+
+/// #562 – Saved parameters for a recurring standing order.
+#[contracttype]
+#[derive(Clone, PartialEq)]
+pub struct StandingOrderParams {
+    pub template_name: String,
+    pub supplier: Address,
+    pub logistics: Address,
+    pub arbiter: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub milestones: Vec<Milestone>,
+    pub interval_ledgers: u32,
+    pub max_occurrences: u32,
+}
+
+/// #562 – On-chain standing order that anyone may execute when due.
+#[contracttype]
+#[derive(Clone, PartialEq)]
+pub struct StandingOrder {
+    pub order_id: u64,
+    pub buyer: Address,
+    pub template_name: String,
+    pub supplier: Address,
+    pub logistics: Address,
+    pub arbiter: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub milestones: Vec<Milestone>,
+    pub interval_ledgers: u32,
+    pub max_occurrences: u32,
+    pub occurrences: u32,
+    pub next_ledger: u32,
+    pub cancelled: bool,
+}
+
+/// #563 – Packed args for `create_shipment_with_allowance` (Soroban 10-arg limit).
+#[contracttype]
+#[derive(Clone)]
+pub struct AllowanceShipmentParams {
+    pub spender: Address,
+    pub from: Address,
+    pub shipment_id: String,
+    pub buyers: Vec<Address>,
+    pub supplier: Address,
+    pub logistics: Address,
+    pub arbiter: Address,
+    pub token: Address,
+    pub total_amount: i128,
+    pub milestones: Vec<Milestone>,
+    pub options: ShipmentOptions,
 }
 
 // ============================================================
@@ -2464,6 +2546,10 @@ impl ChainSettleContract {
         if config.silver_multiplier_bps > 10_000 || config.gold_multiplier_bps > 10_000 {
             panic!("tier multiplier cannot exceed 10000 bps");
         }
+        if config.bronze_max_value < 0 || config.silver_max_value < 0 || config.gold_max_value < 0
+        {
+            panic!("tier max value cannot be negative");
+        }
         env.storage()
             .instance()
             .set(&DataKeyExt2::SupplierTierConfig, &config);
@@ -2817,11 +2903,19 @@ impl ChainSettleContract {
             .get(&DataKey::TotalEscrowed(token.clone()))
             .unwrap_or(0);
 
-        if contract_balance <= total_escrowed {
+        // #561: Vault balances are contract-held buyer funds, not withdrawable dust.
+        let total_vaulted: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt3::TotalVaulted(token.clone()))
+            .unwrap_or(0);
+
+        let reserved = total_escrowed + total_vaulted;
+        if contract_balance <= reserved {
             panic!("no dust available");
         }
 
-        let dust_amount = contract_balance - total_escrowed;
+        let dust_amount = contract_balance - reserved;
 
         token_client.transfer(&env.current_contract_address(), &to, &dust_amount);
 
@@ -2831,6 +2925,433 @@ impl ChainSettleContract {
         );
 
         dust_amount
+    }
+
+    // ----------------------------------------------------------
+    // #561 – BUYER ESCROW VAULT
+    // ----------------------------------------------------------
+
+    /// Deposit tokens into the caller's contract-held vault balance.
+    pub fn vault_deposit(env: Env, buyer: Address, token: Address, amount: i128) {
+        env.storage()
+            .instance()
+            .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
+        Self::assert_not_paused(&env);
+        buyer.require_auth();
+        if amount <= 0 {
+            panic!("amount must be greater than zero");
+        }
+
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&buyer, &env.current_contract_address(), &amount);
+
+        let bal_key = DataKeyExt3::VaultBalance(buyer.clone(), token.clone());
+        let current: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0);
+        env.storage().persistent().set(&bal_key, &(current + amount));
+
+        let total_key = DataKeyExt3::TotalVaulted(token.clone());
+        let total: i128 = env.storage().persistent().get(&total_key).unwrap_or(0);
+        env.storage().persistent().set(&total_key, &(total + amount));
+
+        env.events().publish(
+            (Symbol::new(&env, "vault_deposited"), buyer.clone(), token),
+            (amount, env.ledger().sequence()),
+        );
+    }
+
+    /// Withdraw tokens from the caller's vault balance back to their wallet.
+    pub fn vault_withdraw(env: Env, buyer: Address, token: Address, amount: i128) {
+        env.storage()
+            .instance()
+            .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
+        Self::assert_not_paused(&env);
+        buyer.require_auth();
+        if amount <= 0 {
+            panic!("amount must be greater than zero");
+        }
+
+        let bal_key = DataKeyExt3::VaultBalance(buyer.clone(), token.clone());
+        let current: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0);
+        if amount > current {
+            panic!("insufficient vault balance");
+        }
+        env.storage().persistent().set(&bal_key, &(current - amount));
+
+        let total_key = DataKeyExt3::TotalVaulted(token.clone());
+        let total: i128 = env.storage().persistent().get(&total_key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&total_key, &(total - amount).max(0));
+
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&env.current_contract_address(), &buyer, &amount);
+
+        env.events().publish(
+            (Symbol::new(&env, "vault_withdrawn"), buyer.clone(), token),
+            (amount, env.ledger().sequence()),
+        );
+    }
+
+    /// Read-only vault balance for (buyer, token).
+    pub fn get_vault_balance(env: Env, buyer: Address, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt3::VaultBalance(buyer, token))
+            .unwrap_or(0)
+    }
+
+    /// Debit `amount` from the buyer's vault (and TotalVaulted). Panics if insufficient.
+    fn debit_vault(env: &Env, buyer: &Address, token: &Address, amount: i128) {
+        if amount <= 0 {
+            return;
+        }
+        let bal_key = DataKeyExt3::VaultBalance(buyer.clone(), token.clone());
+        let current: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0);
+        if amount > current {
+            panic!("insufficient vault balance");
+        }
+        env.storage().persistent().set(&bal_key, &(current - amount));
+        let total_key = DataKeyExt3::TotalVaulted(token.clone());
+        let total: i128 = env.storage().persistent().get(&total_key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&total_key, &(total - amount).max(0));
+    }
+
+    /// Credit `amount` into the buyer's vault (and TotalVaulted). Tokens stay in-contract.
+    fn credit_vault(env: &Env, buyer: &Address, token: &Address, amount: i128) {
+        if amount <= 0 {
+            return;
+        }
+        let bal_key = DataKeyExt3::VaultBalance(buyer.clone(), token.clone());
+        let current: i128 = env.storage().persistent().get(&bal_key).unwrap_or(0);
+        env.storage().persistent().set(&bal_key, &(current + amount));
+        let total_key = DataKeyExt3::TotalVaulted(token.clone());
+        let total: i128 = env.storage().persistent().get(&total_key).unwrap_or(0);
+        env.storage().persistent().set(&total_key, &(total + amount));
+    }
+
+    /// Refund escrow to the primary buyer — into the vault when the shipment
+    /// was vault-funded, otherwise via a normal token transfer.
+    fn refund_to_buyer(env: &Env, shipment_id: &String, shipment: &Shipment, amount: i128) {
+        if amount <= 0 {
+            return;
+        }
+        let primary_buyer = shipment.buyers.get(0).unwrap();
+        let from_vault: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt3::FundFromVault(shipment_id.clone()))
+            .unwrap_or(false);
+        if from_vault {
+            Self::credit_vault(env, &primary_buyer, &shipment.token, amount);
+        } else {
+            let token_client = token::Client::new(env, &shipment.token);
+            token_client.transfer(&env.current_contract_address(), &primary_buyer, &amount);
+        }
+    }
+
+    // ----------------------------------------------------------
+    // #563 – FUND ESCROW VIA TOKEN ALLOWANCE
+    // ----------------------------------------------------------
+
+    /// Create a shipment funded by `token.transfer_from(spender, from, …)`.
+    /// `spender` must authorise; `from` must be one of the buyers.
+    pub fn create_shipment_with_allowance(env: Env, params: AllowanceShipmentParams) -> String {
+        env.storage()
+            .instance()
+            .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
+        Self::assert_not_paused(&env);
+        params.spender.require_auth();
+
+        if params.buyers.is_empty() {
+            panic!("at least one buyer is required");
+        }
+        let mut from_is_buyer = false;
+        for i in 0..params.buyers.len() {
+            if params.buyers.get(i).unwrap() == params.from {
+                from_is_buyer = true;
+                break;
+            }
+        }
+        if !from_is_buyer {
+            panic!("from must be one of the buyers");
+        }
+        if params.options.fund_from_vault {
+            panic!("fund_from_vault cannot be combined with allowance funding");
+        }
+        if params.total_amount < constants::MIN_SHIPMENT_AMOUNT {
+            panic!("amount must be greater than zero");
+        }
+
+        env.storage().instance().set(
+            &DataKeyExt3::PendingAllowance,
+            &(params.spender.clone(), params.from.clone()),
+        );
+        env.storage()
+            .instance()
+            .set(&DataKeyExt3::SkipBuyerAuth, &true);
+
+        Self::create_shipment(
+            env,
+            params.shipment_id,
+            params.buyers,
+            params.supplier,
+            params.logistics,
+            params.arbiter,
+            params.token,
+            params.total_amount,
+            params.milestones,
+            params.options,
+        )
+    }
+
+    // ----------------------------------------------------------
+    // #562 – STANDING ORDERS
+    // ----------------------------------------------------------
+
+    /// Register a vault-funded standing order. Returns the new order id.
+    pub fn create_standing_order(env: Env, buyer: Address, params: StandingOrderParams) -> u64 {
+        env.storage()
+            .instance()
+            .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
+        Self::assert_not_paused(&env);
+        buyer.require_auth();
+
+        if params.amount < constants::MIN_SHIPMENT_AMOUNT {
+            panic!("amount must be greater than zero");
+        }
+        if params.interval_ledgers == 0 {
+            panic!("interval_ledgers must be greater than zero");
+        }
+        if params.max_occurrences == 0 {
+            panic!("max_occurrences must be greater than zero");
+        }
+        if params.milestones.is_empty() {
+            panic!("at least one milestone is required");
+        }
+        let mut total_percent: u32 = 0;
+        for i in 0..params.milestones.len() {
+            total_percent += params.milestones.get(i).unwrap().payment_percent;
+        }
+        if total_percent != 100 {
+            panic!("milestone percentages must sum to 100");
+        }
+
+        let order_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt3::NextStandingOrderId)
+            .unwrap_or(1u64);
+        env.storage()
+            .instance()
+            .set(&DataKeyExt3::NextStandingOrderId, &(order_id + 1));
+
+        let order = StandingOrder {
+            order_id,
+            buyer: buyer.clone(),
+            template_name: params.template_name.clone(),
+            supplier: params.supplier,
+            logistics: params.logistics,
+            arbiter: params.arbiter,
+            token: params.token,
+            amount: params.amount,
+            milestones: params.milestones,
+            interval_ledgers: params.interval_ledgers,
+            max_occurrences: params.max_occurrences,
+            occurrences: 0,
+            next_ledger: env.ledger().sequence(),
+            cancelled: false,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKeyExt3::StandingOrder(order_id), &order);
+
+        env.events().publish(
+            (Symbol::new(&env, "standing_order_created"), order_id),
+            (
+                buyer,
+                params.template_name,
+                params.amount,
+                params.interval_ledgers,
+                params.max_occurrences,
+            ),
+        );
+        order_id
+    }
+
+    /// Permissionless: create the next shipment when the standing order is due.
+    /// Returns the generated shipment id.
+    pub fn execute_standing_order(env: Env, order_id: u64) -> String {
+        env.storage()
+            .instance()
+            .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
+        Self::assert_not_paused(&env);
+
+        let key = DataKeyExt3::StandingOrder(order_id);
+        let mut order: StandingOrder = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic!("standing order not found"));
+
+        if order.cancelled {
+            panic!("standing order cancelled");
+        }
+        if order.occurrences >= order.max_occurrences {
+            panic!("standing order exhausted");
+        }
+        let now = env.ledger().sequence();
+        if now < order.next_ledger {
+            panic!("standing order not due");
+        }
+
+        // Deterministic unique shipment id: "so-{order_id}-{occurrence}"
+        let shipment_id =
+            Self::standing_shipment_id(&env, order.order_id, order.occurrences);
+
+        let buyers = {
+            let mut v = Vec::new(&env);
+            v.push_back(order.buyer.clone());
+            v
+        };
+        let mut options = Self::empty_shipment_options(&env);
+        options.fund_from_vault = true;
+
+        env.storage()
+            .instance()
+            .set(&DataKeyExt3::SkipBuyerAuth, &true);
+
+        let created = Self::create_shipment(
+            env.clone(),
+            shipment_id.clone(),
+            buyers,
+            order.supplier.clone(),
+            order.logistics.clone(),
+            order.arbiter.clone(),
+            order.token.clone(),
+            order.amount,
+            order.milestones.clone(),
+            options,
+        );
+
+        order.occurrences += 1;
+        order.next_ledger = now.saturating_add(order.interval_ledgers);
+        env.storage().persistent().set(&key, &order);
+
+        env.events().publish(
+            (Symbol::new(&env, "standing_order_executed"), order_id),
+            (created.clone(), order.occurrences, order.next_ledger),
+        );
+        created
+    }
+
+    /// Buyer cancels a standing order they own.
+    pub fn cancel_standing_order(env: Env, buyer: Address, order_id: u64) {
+        env.storage()
+            .instance()
+            .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
+        buyer.require_auth();
+
+        let key = DataKeyExt3::StandingOrder(order_id);
+        let mut order: StandingOrder = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic!("standing order not found"));
+        if order.buyer != buyer {
+            panic!("unauthorized");
+        }
+        if order.cancelled {
+            panic!("standing order already cancelled");
+        }
+        order.cancelled = true;
+        env.storage().persistent().set(&key, &order);
+
+        env.events().publish(
+            (Symbol::new(&env, "standing_order_cancelled"), order_id),
+            (buyer, env.ledger().sequence()),
+        );
+    }
+
+    pub fn get_standing_order(env: Env, order_id: u64) -> StandingOrder {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt3::StandingOrder(order_id))
+            .unwrap_or_else(|| panic!("standing order not found"))
+    }
+
+    fn standing_shipment_id(env: &Env, order_id: u64, occurrence: u32) -> String {
+        let mut buf = [0u8; 64];
+        let mut len = 0usize;
+        for b in b"so-" {
+            buf[len] = *b;
+            len += 1;
+        }
+        len = Self::append_u64_to_buf(&mut buf, len, order_id);
+        buf[len] = b'-';
+        len += 1;
+        len = Self::append_u64_to_buf(&mut buf, len, occurrence as u64);
+        String::from_bytes(env, &buf[..len])
+    }
+
+    fn append_u64_to_buf(buf: &mut [u8], start: usize, mut n: u64) -> usize {
+        if n == 0 {
+            buf[start] = b'0';
+            return start + 1;
+        }
+        let mut tmp = [0u8; 20];
+        let mut digits = 0usize;
+        while n > 0 {
+            tmp[digits] = b'0' + (n % 10) as u8;
+            n /= 10;
+            digits += 1;
+        }
+        let mut pos = start;
+        while digits > 0 {
+            digits -= 1;
+            buf[pos] = tmp[digits];
+            pos += 1;
+        }
+        pos
+    }
+
+    fn empty_shipment_options(env: &Env) -> ShipmentOptions {
+        ShipmentOptions {
+            response_deadline: 0,
+            penalty_bps: 0,
+            milestone_mode: MilestoneMode::Parallel,
+            holdback_ledgers: 0,
+            dispute_cooldown_ledgers: 0,
+            late_penalty_bps_per_ledger: 0,
+            auto_confirm_ledgers: 0,
+            dispute_bond_amount: 0,
+            dispute_bond_bps: 0,
+            arbiter_fee_bps: 0,
+            logistics_fee_bps: 0,
+            supplier_collateral: 0,
+            expires_at_ledger: None,
+            metadata_hash: None,
+            referrer: None,
+            buyer_cancel_fee_bps: 0,
+            early_bonus_pool: 0,
+            review_window_ledgers: None,
+            milestone_splits: Vec::new(env),
+            deadlines: Vec::new(env),
+            dispute_timeout_seconds: 0,
+            default_resolution: Resolution::Buyer,
+            backup_arbiter: None,
+            confirmation_cooldown_ledgers: None,
+            arbiter_panel: Vec::new(env),
+            jurisdiction: None,
+            grace_period_ledgers: 0,
+            quality_grades: Vec::new(env),
+            milestone_quantities: Vec::new(env),
+            retainage_bps: 0,
+            warranty_bps: 0,
+            warranty_ledgers: 0,
+            fund_from_vault: false,
+        }
     }
 
     /// Get buyer reliability score. Read-only.
@@ -5003,9 +5524,20 @@ impl ChainSettleContract {
             panic!("at least one buyer is required");
         }
 
-        // All co-buyers must authorise the creation.
-        for i in 0..buyers.len() {
-            buyers.get(i).unwrap().require_auth();
+        // All co-buyers must authorise the creation (unless an authorised
+        // entry point such as create_shipment_with_allowance / standing-order
+        // execute already set SkipBuyerAuth).
+        let skip_buyer_auth: bool = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt3::SkipBuyerAuth)
+            .unwrap_or(false);
+        if skip_buyer_auth {
+            env.storage().instance().remove(&DataKeyExt3::SkipBuyerAuth);
+        } else {
+            for i in 0..buyers.len() {
+                buyers.get(i).unwrap().require_auth();
+            }
         }
 
         // Supplier must authorise creation when they are required to lock collateral.
@@ -5029,6 +5561,34 @@ impl ChainSettleContract {
             .unwrap_or(ctx.max_value);
         if effective_max_value > 0 && total_amount > effective_max_value {
             panic!("total amount exceeds maximum shipment value");
+        }
+
+        // #560: Cap a single shipment by the supplier's current tier (0 = unlimited).
+        // Applies in addition to the global / per-token max above.
+        {
+            let tier_config: Option<SupplierTierConfig> = env
+                .storage()
+                .instance()
+                .get(&DataKeyExt2::SupplierTierConfig);
+            if let Some(tier_config) = tier_config {
+                let tier = Self::get_supplier_tier_internal(&env, &supplier);
+                let tier_cap = match tier {
+                    SupplierTier::Bronze => tier_config.bronze_max_value,
+                    SupplierTier::Silver => tier_config.silver_max_value,
+                    SupplierTier::Gold => tier_config.gold_max_value,
+                };
+                if tier_cap > 0 && total_amount > tier_cap {
+                    let tier_name = match tier {
+                        SupplierTier::Bronze => "Bronze",
+                        SupplierTier::Silver => "Silver",
+                        SupplierTier::Gold => "Gold",
+                    };
+                    panic!(
+                        "SupplierTierMaxValueExceeded: {} cap={}",
+                        tier_name, tier_cap
+                    );
+                }
+            }
         }
 
         // #42 / #362: Enforce minimum shipment value floor (0 = disabled),
@@ -5262,25 +5822,63 @@ impl ChainSettleContract {
         Self::check_and_record_shipment_creation(&env, &supplier);
 
         let token_client = token::Client::new(&env, &token);
-        token_client.transfer(
-            &primary_buyer,
-            &env.current_contract_address(),
-            &total_amount,
-        );
+        let fund_from_vault = options.fund_from_vault;
+        let bond_total = if dispute_bond_amount > 0 {
+            dispute_bond_amount * milestones.len() as i128
+        } else {
+            0
+        };
+        let buyer_funding = total_amount
+            + bond_total
+            + if early_bonus_pool > 0 {
+                early_bonus_pool
+            } else {
+                0
+            };
 
-        // Lock dispute bond pool: dispute_bond_amount * number_of_milestones (0 = disabled).
-        if dispute_bond_amount > 0 {
-            let bond_total = dispute_bond_amount * milestones.len() as i128;
-            token_client.transfer(&primary_buyer, &env.current_contract_address(), &bond_total);
+        let pending_allowance: Option<(Address, Address)> = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt3::PendingAllowance);
+        if pending_allowance.is_some() {
+            env.storage()
+                .instance()
+                .remove(&DataKeyExt3::PendingAllowance);
         }
 
-        // Transfer early bonus pool from buyer (separate from escrow; 0 = disabled).
-        if early_bonus_pool > 0 {
+        if let Some((spender, from)) = pending_allowance {
+            token_client.transfer_from(
+                &spender,
+                &from,
+                &env.current_contract_address(),
+                &buyer_funding,
+            );
+        } else if fund_from_vault {
+            // #561: Debit the buyer's vault instead of pulling tokens from their wallet.
+            Self::debit_vault(&env, &primary_buyer, &token, buyer_funding);
+            env.storage()
+                .persistent()
+                .set(&DataKeyExt3::FundFromVault(shipment_id.clone()), &true);
+        } else {
             token_client.transfer(
                 &primary_buyer,
                 &env.current_contract_address(),
-                &early_bonus_pool,
+                &total_amount,
             );
+            if bond_total > 0 {
+                token_client.transfer(
+                    &primary_buyer,
+                    &env.current_contract_address(),
+                    &bond_total,
+                );
+            }
+            if early_bonus_pool > 0 {
+                token_client.transfer(
+                    &primary_buyer,
+                    &env.current_contract_address(),
+                    &early_bonus_pool,
+                );
+            }
         }
 
         // Lock supplier collateral: transfer from supplier and store separately.
@@ -9142,7 +9740,6 @@ impl ChainSettleContract {
             shipment.total_amount - shipment.released_amount - shipment.total_advanced_amount;
         let cancel_fee = (unreleased * shipment.buyer_cancel_fee_bps as i128) / 10_000;
         let refund = unreleased - cancel_fee;
-        let primary_buyer = shipment.buyers.get(0).unwrap();
         let token_client = token::Client::new(&env, &shipment.token);
 
         if cancel_fee > 0 {
@@ -9153,7 +9750,7 @@ impl ChainSettleContract {
             );
         }
         if refund > 0 {
-            token_client.transfer(&env.current_contract_address(), &primary_buyer, &refund);
+            Self::refund_to_buyer(&env, &shipment_id, &shipment, refund);
         }
 
         // Forfeit supplier collateral to buyer on buyer-initiated cancellation.
@@ -9163,7 +9760,7 @@ impl ChainSettleContract {
             .get(&DataKey::SupplierCollateral(shipment_id.clone()))
             .unwrap_or(0);
         if collateral > 0 {
-            token_client.transfer(&env.current_contract_address(), &primary_buyer, &collateral);
+            Self::refund_to_buyer(&env, &shipment_id, &shipment, collateral);
         }
 
         Self::refund_holdbacks_on_cancel(&env, &shipment_id, &mut shipment, buyer.clone());
@@ -16200,6 +16797,10 @@ mod test_rate_limit_exemption;
 mod test_arbiter_repetition_guard;
 mod test_pause_notice;
 mod test_buyer_cap_collateral_merge;
+mod test_tier_max_value;
+mod test_buyer_vault;
+mod test_standing_orders;
+mod test_allowance_funding;
 // Disabled: exercises milestone insurance holdback / oracle price-condition
 // APIs (see NEW_MILESTONE_FEATURES.md) that have not been implemented yet.
 // mod test_milestone_insurance_and_oracle;
