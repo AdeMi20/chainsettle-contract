@@ -62,3 +62,13 @@ pub const MAX_RETAINAGE_BPS: u32 = 2_000;
 
 /// Maximum warranty holdback a shipment may withhold from each milestone payment (#521).
 pub const MAX_WARRANTY_BPS: u32 = 2_000;
+
+/// Semantic contract version — must match `contracts/chainsetttle/Cargo.toml`.
+/// #571
+pub const VERSION_MAJOR: u32 = 0;
+pub const VERSION_MINOR: u32 = 1;
+pub const VERSION_PATCH: u32 = 0;
+
+/// Storage schema version written by `migrate` (#571). Bump when persistent
+/// layout changes require a post-upgrade migration.
+pub const STORAGE_SCHEMA_VERSION: u32 = 1;
