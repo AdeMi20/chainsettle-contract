@@ -1676,9 +1676,32 @@ impl ChainSettleContract {
         );
     }
 
-    /// Migration stub — call once after upgrade to perform any data-model changes.
-    pub fn migrate(_env: Env) {
-        // No-op for current version; implement data migrations here post-upgrade.
+    /// Migration entrypoint — call once after upgrade to perform data-model changes.
+    /// Sets / bumps the instance-stored storage schema version (#571).
+    pub fn migrate(env: Env) {
+        env.storage().instance().set(
+            &DataKeyExt3::StorageSchemaVersion,
+            &constants::STORAGE_SCHEMA_VERSION,
+        );
+    }
+
+    /// #571: Semantic contract version `(major, minor, patch)` matching Cargo.toml.
+    /// Read-only; no authorization required.
+    pub fn version(_env: Env) -> (u32, u32, u32) {
+        (
+            constants::VERSION_MAJOR,
+            constants::VERSION_MINOR,
+            constants::VERSION_PATCH,
+        )
+    }
+
+    /// #571: Storage schema version from instance storage (set by `migrate`).
+    /// Returns `0` if `migrate` has never been called. Read-only; no auth.
+    pub fn storage_schema_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKeyExt3::StorageSchemaVersion)
+            .unwrap_or(0)
     }
 
     // ----------------------------------------------------------
@@ -5396,8 +5419,8 @@ impl ChainSettleContract {
 
             buyers,
             supplier: supplier.clone(),
-            logistics,
-            arbiter,
+            logistics: logistics.clone(),
+            arbiter: arbiter.clone(),
             token: token.clone(),
             total_amount,
             released_amount: 0,
@@ -5621,6 +5644,18 @@ impl ChainSettleContract {
                 constants::TTL_MAX_LEDGERS,
             );
         }
+
+        // #572 / #573: Index by arbiter and logistics for party dashboards.
+        Self::add_to_party_index(
+            &env,
+            DataKeyExt3::ArbiterShipments(arbiter.clone()),
+            &shipment_id,
+        );
+        Self::add_to_party_index(
+            &env,
+            DataKeyExt3::LogisticsShipments(logistics.clone()),
+            &shipment_id,
+        );
 
         // Add to AllShipments list for pagination.
         let mut all_shipments: Vec<String> = env
@@ -8064,7 +8099,9 @@ impl ChainSettleContract {
             .get(0)
             .unwrap_or(idx);
             let next_idx = (chosen_idx + 1) % pool.len() as u32;
+            let old_arbiter = shipment.arbiter.clone();
             shipment.arbiter = pool.get(chosen_idx).unwrap();
+            Self::reindex_arbiter(&env, &shipment_id, &old_arbiter, &shipment.arbiter);
             env.storage().instance().set(&pool_idx_key, &next_idx);
             Self::record_supplier_arbiters(
                 &env,
@@ -9130,7 +9167,9 @@ impl ChainSettleContract {
         );
 
         let mut milestone = shipment.milestones.get(milestone_index).unwrap();
+        let old_arbiter = shipment.arbiter.clone();
         shipment.arbiter = new_arbiter.clone();
+        Self::reindex_arbiter(&env, &shipment_id, &old_arbiter, &shipment.arbiter);
         milestone.release_after_ledger = 0;
         milestone.status = MilestoneStatus::Disputed;
         milestone.dispute_opened_ledger = Some(env.ledger().sequence());
@@ -9790,6 +9829,68 @@ impl ChainSettleContract {
     }
 
     // ----------------------------------------------------------
+    // TRANSFER LOGISTICS (#573)
+    // ----------------------------------------------------------
+
+    /// Transfer the logistics provider role to a new address.
+    /// Requires auth from both current and new logistics parties.
+    /// Disallowed if any milestone is currently Disputed.
+    pub fn transfer_logistics(
+        env: Env,
+        current_logistics: Address,
+        shipment_id: String,
+        new_logistics: Address,
+    ) {
+        Self::assert_not_paused(&env);
+        current_logistics.require_auth();
+        new_logistics.require_auth();
+
+        let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
+
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        if current_logistics != shipment.logistics {
+            panic!("unauthorized");
+        }
+
+        Self::assert_no_open_disputes(&shipment);
+
+        shipment.logistics = new_logistics.clone();
+
+        Self::remove_from_party_index(
+            &env,
+            DataKeyExt3::LogisticsShipments(current_logistics.clone()),
+            &shipment_id,
+        );
+        Self::add_to_party_index(
+            &env,
+            DataKeyExt3::LogisticsShipments(new_logistics.clone()),
+            &shipment_id,
+        );
+
+        Self::append_audit_entry(
+            &env,
+            &mut shipment,
+            current_logistics.clone(),
+            Symbol::new(&env, "logistics_transferred"),
+            Symbol::new(&env, "transfer_logistics"),
+        );
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "logistics_transferred"),
+                shipment_id.clone(),
+            ),
+            (current_logistics, new_logistics),
+        );
+    }
+
+    // ----------------------------------------------------------
     // ARBITER ROTATION
     // ----------------------------------------------------------
 
@@ -9843,7 +9944,9 @@ impl ChainSettleContract {
 
         if let Some(new_arbiter) = replacement {
             env.storage().instance().set(&pool_idx_key, &current_idx);
+            let old_arbiter = shipment.arbiter.clone();
             shipment.arbiter = new_arbiter.clone();
+            Self::reindex_arbiter(&env, &shipment_id, &old_arbiter, &shipment.arbiter);
 
             env.storage()
                 .persistent()
@@ -9917,7 +10020,9 @@ impl ChainSettleContract {
 
         if proposal.buyer_agreed && proposal.supplier_agreed {
             let mut updated_shipment = shipment.clone();
+            let old_arbiter = updated_shipment.arbiter.clone();
             updated_shipment.arbiter = new_arbiter.clone();
+            Self::reindex_arbiter(&env, &shipment_id, &old_arbiter, &new_arbiter);
 
             Self::append_audit_entry(
                 &env,
@@ -10373,6 +10478,7 @@ impl ChainSettleContract {
             if shipment.arbiter != backup {
                 let old_arbiter = shipment.arbiter.clone();
                 shipment.arbiter = backup.clone();
+                Self::reindex_arbiter(&env, &shipment_id, &old_arbiter, &backup);
 
                 env.storage().persistent().set(
                     &DataKeyExt::DisputeOpenedAt(shipment_id.clone(), milestone_index),
@@ -11815,6 +11921,7 @@ impl ChainSettleContract {
 
         let old_arbiter = shipment.arbiter.clone();
         shipment.arbiter = backup.clone();
+        Self::reindex_arbiter(&env, &shipment_id, &old_arbiter, &backup);
 
         env.storage()
             .persistent()
@@ -13935,6 +14042,163 @@ impl ChainSettleContract {
         seen.len() as u32
     }
 
+    /// #572: Paginated list of shipment IDs currently assigned to `arbiter`.
+    /// Read-only; no authorization required. `cursor` is a 0-based index into
+    /// the arbiter's index; `limit` is clamped to `LIST_SHIPMENTS_MAX_PAGE`.
+    pub fn get_shipments_by_arbiter(
+        env: Env,
+        arbiter: Address,
+        cursor: Option<u32>,
+        limit: u32,
+    ) -> Vec<String> {
+        let list: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt3::ArbiterShipments(arbiter))
+            .unwrap_or_else(|| Vec::new(&env));
+        Self::paginate_shipment_ids(&env, &list, cursor, limit)
+    }
+
+    /// #573: Paginated list of shipment IDs involving `logistics`.
+    /// Read-only; no authorization required. Same pagination rules as
+    /// `get_shipments_by_arbiter`. Archived shipments remain in the index
+    /// (consistent with buyer/supplier indexes).
+    pub fn get_shipments_by_logistics(
+        env: Env,
+        logistics: Address,
+        cursor: Option<u32>,
+        limit: u32,
+    ) -> Vec<String> {
+        let list: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt3::LogisticsShipments(logistics))
+            .unwrap_or_else(|| Vec::new(&env));
+        Self::paginate_shipment_ids(&env, &list, cursor, limit)
+    }
+
+    /// #574: Upcoming milestone deadlines for `address` as buyer or supplier.
+    /// Returns `(shipment_id, milestone_index, deadline_ledger)` for Pending or
+    /// ProofSubmitted milestones on Active shipments whose effective deadline
+    /// falls in `(now, now + within_ledgers]`, sorted ascending, capped at `limit`.
+    /// Read-only; no authorization required.
+    pub fn get_upcoming_deadlines(
+        env: Env,
+        address: Address,
+        within_ledgers: u32,
+        limit: u32,
+    ) -> Vec<(String, u32, u32)> {
+        if within_ledgers == 0 || limit == 0 {
+            return Vec::new(&env);
+        }
+        let capped_limit = if limit > constants::LIST_SHIPMENTS_MAX_PAGE {
+            constants::LIST_SHIPMENTS_MAX_PAGE
+        } else {
+            limit
+        };
+
+        let buyer_ids: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BuyerShipments(address.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        let supplier_ids: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SupplierShipments(address.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut shipment_ids: Vec<String> = Vec::new(&env);
+        for i in 0..buyer_ids.len() {
+            shipment_ids.push_back(buyer_ids.get(i).unwrap());
+        }
+        for i in 0..supplier_ids.len() {
+            let id = supplier_ids.get(i).unwrap();
+            let mut already = false;
+            for j in 0..shipment_ids.len() {
+                if shipment_ids.get(j).unwrap() == id {
+                    already = true;
+                    break;
+                }
+            }
+            if !already {
+                shipment_ids.push_back(id);
+            }
+        }
+
+        let now = env.ledger().sequence();
+        let window_end = now.saturating_add(within_ledgers);
+        let mut results: Vec<(String, u32, u32)> = Vec::new(&env);
+
+        for i in 0..shipment_ids.len() {
+            let shipment_id = shipment_ids.get(i).unwrap();
+            if !env
+                .storage()
+                .persistent()
+                .has(&DataKey::Shipment(shipment_id.clone()))
+            {
+                continue;
+            }
+            let shipment = Self::get_shipment_internal(&env, &shipment_id);
+            if shipment.status != ShipmentStatus::Active {
+                continue;
+            }
+            // Address must still be buyer or supplier on this shipment.
+            if !Self::is_buyer(&shipment, &address) && shipment.supplier != address {
+                continue;
+            }
+
+            for (mi, milestone) in shipment.milestones.iter().enumerate() {
+                let status_ok = milestone.status == MilestoneStatus::Pending
+                    || milestone.status == MilestoneStatus::ProofSubmitted;
+                if !status_ok {
+                    continue;
+                }
+                let deadline: u32 = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKeyExt::MilestoneDeadline(
+                        shipment_id.clone(),
+                        mi as u32,
+                    ))
+                    .unwrap_or(milestone.deadline_ledger);
+                if deadline == 0 {
+                    continue;
+                }
+                if deadline > now && deadline <= window_end {
+                    results.push_back((shipment_id.clone(), mi as u32, deadline));
+                }
+            }
+        }
+
+        // Insertion-sort by deadline ascending.
+        let n = results.len();
+        if n > 1 {
+            for i in 1..n {
+                let mut j = i;
+                while j > 0 {
+                    let prev = results.get(j - 1).unwrap();
+                    let curr = results.get(j).unwrap();
+                    if curr.2 < prev.2 {
+                        results.set(j - 1, curr.clone());
+                        results.set(j, prev);
+                        j -= 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let mut out: Vec<(String, u32, u32)> = Vec::new(&env);
+        let mut k = 0u32;
+        while k < results.len() as u32 && k < capped_limit {
+            out.push_back(results.get(k).unwrap());
+            k += 1;
+        }
+        out
+    }
+
     // ----------------------------------------------------------
     // INTERNAL HELPERS
     // ----------------------------------------------------------
@@ -15693,6 +15957,87 @@ impl ChainSettleContract {
     ) {
         Self::remove_from_status_index(env, from, shipment_id);
         Self::add_to_status_index(env, to, shipment_id);
+    }
+
+    /// Append a shipment ID to a party index (`ArbiterShipments` / `LogisticsShipments`).
+    fn add_to_party_index(env: &Env, key: DataKeyExt3, shipment_id: &String) {
+        let mut list: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+        // Avoid duplicate entries if the same party is re-indexed.
+        for i in 0..list.len() {
+            if list.get(i).unwrap() == *shipment_id {
+                return;
+            }
+        }
+        list.push_back(shipment_id.clone());
+        env.storage().persistent().set(&key, &list);
+        env.storage().persistent().extend_ttl(
+            &key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+    }
+
+    /// Remove the first matching shipment ID from a party index.
+    fn remove_from_party_index(env: &Env, key: DataKeyExt3, shipment_id: &String) {
+        let list: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+        let mut new_list: Vec<String> = Vec::new(env);
+        let mut removed = false;
+        for i in 0..list.len() {
+            let id = list.get(i).unwrap();
+            if !removed && id == *shipment_id {
+                removed = true;
+            } else {
+                new_list.push_back(id);
+            }
+        }
+        env.storage().persistent().set(&key, &new_list);
+    }
+
+    /// Move a shipment between arbiter indexes when the assigned arbiter changes (#572).
+    fn reindex_arbiter(env: &Env, shipment_id: &String, old: &Address, new: &Address) {
+        if old == new {
+            return;
+        }
+        Self::remove_from_party_index(
+            env,
+            DataKeyExt3::ArbiterShipments(old.clone()),
+            shipment_id,
+        );
+        Self::add_to_party_index(env, DataKeyExt3::ArbiterShipments(new.clone()), shipment_id);
+    }
+
+    /// Cursor/limit page over a shipment-ID list (stable, non-overlapping).
+    fn paginate_shipment_ids(
+        env: &Env,
+        source: &Vec<String>,
+        cursor: Option<u32>,
+        limit: u32,
+    ) -> Vec<String> {
+        let clamped_limit = if limit > constants::LIST_SHIPMENTS_MAX_PAGE {
+            constants::LIST_SHIPMENTS_MAX_PAGE
+        } else {
+            limit
+        };
+        let start_idx = cursor.unwrap_or(0);
+        let total_len = source.len() as u32;
+        let mut result: Vec<String> = Vec::new(env);
+        if start_idx >= total_len || clamped_limit == 0 {
+            return result;
+        }
+        let mut idx = start_idx;
+        while idx < total_len && (result.len() as u32) < clamped_limit {
+            result.push_back(source.get(idx).unwrap());
+            idx += 1;
+        }
+        result
     }
 
     // ----------------------------------------------------------

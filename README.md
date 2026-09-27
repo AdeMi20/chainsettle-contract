@@ -706,6 +706,60 @@ stellar contract invoke \
   --address <ADDRESS>
 ```
 
+`get_shipments_by_arbiter(arbiter, cursor, limit) → Vec<String>` (read-only) — #572
+
+Returns a page of shipment IDs currently assigned to `arbiter`. The index is updated on creation, arbiter rotation, appeal reassignment, recusal, and backup activation. Removing an arbiter from a shipment also removes that shipment from their index. Pagination uses a 0-based `cursor` into the index and clamps `limit` to `LIST_SHIPMENTS_MAX_PAGE` (50).
+
+```bash
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --network testnet \
+  -- get_shipments_by_arbiter \
+  --arbiter <ARBITER_ADDRESS> \
+  --cursor null \
+  --limit 20
+```
+
+`get_shipments_by_logistics(logistics, cursor, limit) → Vec<String>` (read-only) — #573
+
+Returns a page of shipment IDs involving `logistics`. The index is maintained on creation and on `transfer_logistics`. Archived shipments remain listed (same behaviour as the buyer/supplier indexes).
+
+```bash
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --network testnet \
+  -- get_shipments_by_logistics \
+  --logistics <LOGISTICS_ADDRESS> \
+  --cursor null \
+  --limit 20
+```
+
+`transfer_logistics(current_logistics, shipment_id, new_logistics)` — #573
+
+Transfers the logistics provider role. Requires auth from both the current and new logistics addresses. Updates the logistics shipment index accordingly. Blocked while any milestone is disputed.
+
+`get_upcoming_deadlines(address, within_ledgers, limit) → Vec<(String, u32, u32)>` (read-only) — #574
+
+Returns upcoming milestone deadlines for shipments where `address` is buyer or supplier. Each entry is `(shipment_id, milestone_index, deadline_ledger)`. Only `Pending` / `ProofSubmitted` milestones on `Active` shipments whose effective deadline falls in `(now, now + within_ledgers]` are included. Results are sorted by deadline ascending and capped at `limit` (clamped to 50).
+
+```bash
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --network testnet \
+  -- get_upcoming_deadlines \
+  --address <ADDRESS> \
+  --within_ledgers 1000 \
+  --limit 20
+```
+
+`version() → (u32, u32, u32)` (read-only) — #571
+
+Returns the semantic contract version `(major, minor, patch)` sourced from constants that match `contracts/chainsetttle/Cargo.toml`. No authorization required.
+
+`storage_schema_version() → u32` (read-only) — #571
+
+Returns the instance-stored storage schema version written by `migrate`. Returns `0` until `migrate` has been called after an upgrade. No authorization required.
+
 `get_contract_stats() → ContractStats` (read-only)
 
 Returns contract-level aggregate statistics. No authorization is required. All counters default to `0` if no shipments have been created yet.
@@ -1928,8 +1982,9 @@ When multi-admin governance is enabled, upgrades must be proposed and approved b
 Post-upgrade state migration entrypoint.
 
 - **Who can call:** Public / post-upgrade execution hook.
-- **What it does post-upgrade:** Called once immediately after a WASM bytecode upgrade to execute state schema transformations, re-key storage entries (e.g. migrating `V1_*` storage keys to `V2_*` schema), or set new storage defaults.
-- **Idempotency:** Designed to be safe to invoke post-upgrade without side-effects when no data model changes are required (currently operates as an idempotent stub for the active contract version).
+- **What it does post-upgrade:** Called once immediately after a WASM bytecode upgrade to execute state schema transformations, re-key storage entries (e.g. migrating `V1_*` storage keys to `V2_*` schema), or set new storage defaults. As of #571 it also writes `StorageSchemaVersion` (currently `1`, matching `constants::STORAGE_SCHEMA_VERSION`) so integrators can read it via `storage_schema_version()`.
+- **Release process:** When shipping a release that changes on-disk layout, bump `version` in `contracts/chainsetttle/Cargo.toml`, keep `VERSION_MAJOR` / `VERSION_MINOR` / `VERSION_PATCH` in sync, bump `STORAGE_SCHEMA_VERSION`, and ensure `migrate` writes the new schema version.
+- **Idempotency:** Safe to re-invoke; repeated calls keep the same schema version when unchanged.
 
 ---
 
