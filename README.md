@@ -444,6 +444,18 @@ shipment's `total_amount`, and leaves the milestone percentages unchanged.
 That means every milestone keeps the same percentage split, but each
 milestone's absolute payout becomes larger because the escrow base grew.
 
+`propose_milestone_split(caller, shipment_id, milestone_index, parts)` and
+`approve_milestone_split(counterparty, shipment_id, milestone_index)`
+let the buyer and supplier jointly replace one pending milestone with two or
+more named parts. Each part contains a `name` and `payment_percent`; the part
+percentages must sum to the original milestone percentage, and the resulting
+milestone count must remain within the configured maximum. Only a pending
+milestone with no proof, advance, dispute, or quantity progress is eligible.
+The proposal does not alter the shipment. The split is applied only after the
+other party approves it; the original deadline and penalty settings are copied
+to each part, later milestones and their indexed state shift forward, and
+escrow plus the total payout weights remain unchanged.
+
 ---
 
 Partial Disputes & Escalation Checks

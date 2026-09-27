@@ -1418,6 +1418,10 @@ pub enum DataKeyExt3 {
     /// Pending proposal to merge `first_index` and `first_index + 1`.
     MilestoneMergeProposal(String),
 
+    // ── Pending milestone split by mutual consent ──────────────────────────
+    /// Proposed parts for a pending milestone split.
+    MilestoneSplitProposal(String),
+
     // ── #478 Supplier tier change events ──────────────────────────────────
     /// Last tier observed for a supplier (absent = Bronze); compared on each
     /// evaluation so `supplier_tier_changed` fires only on an actual change.
@@ -1468,12 +1472,72 @@ pub enum DataKeyExt3 {
     ConditionBreachReports(String, u32),
 }
 
+#[contracttype]
+pub enum DataKeyExt4 {
+    StorageSchemaVersion,
+    ArbiterShipments(Address),
+    LogisticsShipments(Address),
+    CleanCompletionRebateBps,
+    ShipmentFeesPaid(String),
+    ArbiterSlashBps,
+    ArbiterStake(Address),
+    SubstituteProposal(String, u32),
+    MilestoneSupplier(String, u32),
+    ShipmentHadDispute(String),
+}
+
+#[allow(non_snake_case, non_upper_case_globals)]
+impl DataKeyExt3 {
+    pub const StorageSchemaVersion: DataKeyExt4 = DataKeyExt4::StorageSchemaVersion;
+    pub const CleanCompletionRebateBps: DataKeyExt4 = DataKeyExt4::CleanCompletionRebateBps;
+    pub const ArbiterSlashBps: DataKeyExt4 = DataKeyExt4::ArbiterSlashBps;
+
+    pub fn ArbiterShipments(address: Address) -> DataKeyExt4 {
+        DataKeyExt4::ArbiterShipments(address)
+    }
+    pub fn LogisticsShipments(address: Address) -> DataKeyExt4 {
+        DataKeyExt4::LogisticsShipments(address)
+    }
+    pub fn ShipmentFeesPaid(shipment_id: String) -> DataKeyExt4 {
+        DataKeyExt4::ShipmentFeesPaid(shipment_id)
+    }
+    pub fn ArbiterStake(address: Address) -> DataKeyExt4 {
+        DataKeyExt4::ArbiterStake(address)
+    }
+    pub fn SubstituteProposal(shipment_id: String, milestone_index: u32) -> DataKeyExt4 {
+        DataKeyExt4::SubstituteProposal(shipment_id, milestone_index)
+    }
+    pub fn MilestoneSupplier(shipment_id: String, milestone_index: u32) -> DataKeyExt4 {
+        DataKeyExt4::MilestoneSupplier(shipment_id, milestone_index)
+    }
+    pub fn ShipmentHadDispute(shipment_id: String) -> DataKeyExt4 {
+        DataKeyExt4::ShipmentHadDispute(shipment_id)
+    }
+}
+
 /// #517 – Pending proposal to merge two adjacent Pending milestones.
 #[contracttype]
 #[derive(Clone, PartialEq, Debug)]
 pub struct MilestoneMergeProposal {
     pub first_index: u32,
     pub proposer: Address,
+}
+
+/// Name and payment percentage for one part of a proposed milestone split.
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub struct MilestoneSplitPart {
+    pub name: String,
+    pub payment_percent: u32,
+}
+
+/// Pending mutual-consent split proposal for one milestone.
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub struct MilestoneSplitProposal {
+    pub milestone_index: u32,
+    pub proposer: Address,
+    pub parts: Vec<MilestoneSplitPart>,
 }
 
 /// Partial joint-confirmation progress for a high-value shipment's milestone (#367).
@@ -3398,6 +3462,561 @@ impl ChainSettleContract {
         );
     }
 
+    // ----------------------------------------------------------
+    // SPLIT A PENDING MILESTONE BY MUTUAL CONSENT
+    // ----------------------------------------------------------
+
+    /// Propose replacing one pending milestone with two or more named parts.
+    /// The percentages must sum to the original milestone's percentage.
+    pub fn propose_milestone_split(
+        env: Env,
+        caller: Address,
+        shipment_id: String,
+        milestone_index: u32,
+        parts: Vec<MilestoneSplitPart>,
+    ) {
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+        let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        Self::assert_buyer_or_supplier(&shipment, &caller);
+        Self::validate_milestone_split(&env, &shipment, &shipment_id, milestone_index, &parts);
+
+        let key = DataKeyExt3::MilestoneSplitProposal(shipment_id.clone());
+        env.storage().persistent().set(
+            &key,
+            &MilestoneSplitProposal {
+                milestone_index,
+                proposer: caller.clone(),
+                parts: parts.clone(),
+            },
+        );
+        env.storage().persistent().extend_ttl(
+            &key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+
+        Self::append_audit_entry(
+            &env,
+            &mut shipment,
+            caller.clone(),
+            Symbol::new(&env, "split_proposed"),
+            Symbol::new(&env, "propose_milestone_split"),
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+        env.events().publish(
+            (Symbol::new(&env, "milestone_split_proposed"), shipment_id),
+            (milestone_index, caller, parts.len()),
+        );
+    }
+
+    /// Apply a pending milestone split once the counterparty approves it.
+    pub fn approve_milestone_split(
+        env: Env,
+        counterparty: Address,
+        shipment_id: String,
+        milestone_index: u32,
+    ) {
+        Self::assert_not_paused(&env);
+        counterparty.require_auth();
+        let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        Self::assert_buyer_or_supplier(&shipment, &counterparty);
+
+        let proposal_key = DataKeyExt3::MilestoneSplitProposal(shipment_id.clone());
+        let proposal: MilestoneSplitProposal = env
+            .storage()
+            .persistent()
+            .get(&proposal_key)
+            .unwrap_or_else(|| panic!("no pending milestone split proposal"));
+        if proposal.milestone_index != milestone_index {
+            panic!("split index does not match proposal");
+        }
+        if (proposal.proposer == shipment.supplier) == (counterparty == shipment.supplier) {
+            panic!("split must be approved by the counterparty");
+        }
+        Self::validate_milestone_split(
+            &env,
+            &shipment,
+            &shipment_id,
+            milestone_index,
+            &proposal.parts,
+        );
+
+        let old_len = shipment.milestones.len();
+        let part_count = proposal.parts.len();
+        let shift = part_count - 1;
+        let original = shipment.milestones.get(milestone_index).unwrap();
+        let old_extended_deadline: Option<u32> = env.storage().persistent().get(
+            &DataKeyExt::MilestoneDeadline(shipment_id.clone(), milestone_index),
+        );
+        let split_weights = Self::milestone_split_distribution(
+            &env,
+            &shipment_id,
+            milestone_index,
+            original.payment_percent,
+            &proposal.parts,
+        );
+        let split_quantities = Self::milestone_quantity_distribution(
+            &env,
+            &shipment_id,
+            milestone_index,
+            original.payment_percent,
+            &proposal.parts,
+        );
+
+        let timestamp_deadlines: Option<Vec<u64>> = env.storage().persistent().get(
+            &DataKeyExt::MilestoneTimestampDeadlines(shipment_id.clone()),
+        );
+        let proof_submitters: Option<Vec<Address>> = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt3::ProofSubmitters(shipment_id.clone()));
+        let inspected_milestones: Option<Vec<u32>> = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt3::InspectedMilestones(shipment_id.clone()));
+
+        let mut milestones = Vec::new(&env);
+        for i in 0..old_len {
+            if i == milestone_index {
+                for part in proposal.parts.iter() {
+                    let mut split = original.clone();
+                    split.name = part.name;
+                    split.payment_percent = part.payment_percent;
+                    milestones.push_back(split);
+                }
+            } else {
+                milestones.push_back(shipment.milestones.get(i).unwrap());
+            }
+        }
+
+        Self::shift_milestone_storage_up(
+            &env,
+            &shipment_id,
+            milestone_index + 1,
+            old_len,
+            shift,
+        );
+        for idx in milestone_index + 1..milestone_index + part_count {
+            Self::clear_milestone_storage(&env, &shipment_id, idx);
+        }
+
+        if let Some(deadline) = old_extended_deadline {
+            for idx in milestone_index..milestone_index + part_count {
+                env.storage().persistent().set(
+                    &DataKeyExt::MilestoneDeadline(shipment_id.clone(), idx),
+                    &deadline,
+                );
+            }
+        }
+        if let Some(weights) = split_weights {
+            env.storage().persistent().set(
+                &DataKeyExt::MilestoneSplits(shipment_id.clone()),
+                &weights,
+            );
+        }
+        if let Some(quantities) = split_quantities {
+            env.storage().persistent().set(
+                &DataKeyExt3::MilestoneQuantities(shipment_id.clone()),
+                &quantities,
+            );
+        }
+        if let Some(deadlines) = timestamp_deadlines {
+            let original_deadline = deadlines.get(milestone_index).unwrap();
+            let mut updated = Vec::new(&env);
+            for i in 0..deadlines.len() {
+                if i == milestone_index {
+                    for _ in 0..part_count {
+                        updated.push_back(original_deadline);
+                    }
+                } else {
+                    updated.push_back(deadlines.get(i).unwrap());
+                }
+            }
+            env.storage().persistent().set(
+                &DataKeyExt::MilestoneTimestampDeadlines(shipment_id.clone()),
+                &updated,
+            );
+        }
+        if let Some(submitters) = proof_submitters {
+            let original_submitter = submitters.get(milestone_index).unwrap();
+            let mut updated = Vec::new(&env);
+            for i in 0..submitters.len() {
+                if i == milestone_index {
+                    for _ in 0..part_count {
+                        updated.push_back(original_submitter.clone());
+                    }
+                } else {
+                    updated.push_back(submitters.get(i).unwrap());
+                }
+            }
+            env.storage().persistent().set(
+                &DataKeyExt3::ProofSubmitters(shipment_id.clone()),
+                &updated,
+            );
+        }
+        if let Some(inspected) = inspected_milestones {
+            let mut updated = Vec::new(&env);
+            for idx in inspected.iter() {
+                if idx == milestone_index {
+                    for part_offset in 0..part_count {
+                        updated.push_back(milestone_index + part_offset);
+                    }
+                } else if idx > milestone_index {
+                    updated.push_back(idx + shift);
+                } else {
+                    updated.push_back(idx);
+                }
+            }
+            env.storage().persistent().set(
+                &DataKeyExt3::InspectedMilestones(shipment_id.clone()),
+                &updated,
+            );
+        }
+
+        shipment.milestones = milestones;
+        if let Some(last) = shipment.last_confirmed_milestone_index {
+            if last > milestone_index {
+                shipment.last_confirmed_milestone_index = Some(last + shift);
+            }
+        }
+        Self::shift_active_disputes_up(&env, &shipment_id, milestone_index, shift);
+        env.storage().persistent().remove(&proposal_key);
+
+        Self::append_audit_entry(
+            &env,
+            &mut shipment,
+            counterparty.clone(),
+            Symbol::new(&env, "milestones_split"),
+            Symbol::new(&env, "approve_milestone_split"),
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+        env.events().publish(
+            (Symbol::new(&env, "milestones_split"), shipment_id),
+            (milestone_index, part_count, counterparty),
+        );
+    }
+
+    /// Returns the pending split proposal for a shipment, if any.
+    pub fn get_milestone_split_proposal(
+        env: Env,
+        shipment_id: String,
+    ) -> Option<MilestoneSplitProposal> {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt3::MilestoneSplitProposal(shipment_id))
+    }
+
+    fn validate_milestone_split(
+        env: &Env,
+        shipment: &Shipment,
+        shipment_id: &String,
+        milestone_index: u32,
+        parts: &Vec<MilestoneSplitPart>,
+    ) {
+        if milestone_index >= shipment.milestones.len() {
+            panic!("invalid milestone index");
+        }
+        if parts.len() < 2 {
+            panic!("a milestone split requires at least two parts");
+        }
+        Self::assert_milestone_splittable(env, shipment, shipment_id, milestone_index);
+
+        let original = shipment.milestones.get(milestone_index).unwrap();
+        let minimum_percent: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinMilestonePercent)
+            .unwrap_or(5);
+        let mut total_percent = 0u32;
+        for part in parts.iter() {
+            if part.name.is_empty() || part.payment_percent < minimum_percent {
+                panic!("invalid milestone split part");
+            }
+            total_percent = total_percent
+                .checked_add(part.payment_percent)
+                .unwrap_or_else(|| panic!("milestone split percentages overflow"));
+        }
+        if total_percent != original.payment_percent {
+            panic!("split percentages must equal the original milestone percentage");
+        }
+
+        let new_count = shipment
+            .milestones
+            .len()
+            .checked_add(parts.len() - 1)
+            .unwrap_or_else(|| panic!("TooManyMilestones"));
+        let max_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt2::MaxMilestoneCount)
+            .unwrap_or(constants::DEFAULT_MAX_MILESTONE_COUNT);
+        if new_count > max_count {
+            panic!("TooManyMilestones");
+        }
+
+        Self::milestone_split_distribution(
+            env,
+            shipment_id,
+            milestone_index,
+            original.payment_percent,
+            parts,
+        );
+        Self::milestone_quantity_distribution(
+            env,
+            shipment_id,
+            milestone_index,
+            original.payment_percent,
+            parts,
+        );
+    }
+
+    fn assert_milestone_splittable(
+        env: &Env,
+        shipment: &Shipment,
+        shipment_id: &String,
+        milestone_index: u32,
+    ) {
+        let milestone = shipment.milestones.get(milestone_index).unwrap();
+        if milestone.status != MilestoneStatus::Pending || !milestone.proof_hash.is_empty() {
+            panic!("only pending milestones without proof can be split");
+        }
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::AdvanceRequest(shipment_id.clone(), milestone_index))
+        {
+            panic!("cannot split a milestone with an advance");
+        }
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKeyExt::DisputeOpenedAt(
+                shipment_id.clone(),
+                milestone_index,
+            ))
+            || env.storage().persistent().has(&DataKey::DisputeContestedPercent(
+                shipment_id.clone(),
+                milestone_index,
+            ))
+        {
+            panic!("cannot split a disputed milestone");
+        }
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKeyExt3::PendingDualProof(
+                shipment_id.clone(),
+                milestone_index,
+            ))
+            || env
+                .storage()
+                .persistent()
+                .has(&DataKeyExt3::ConditionBreachReports(
+                    shipment_id.clone(),
+                    milestone_index,
+                ))
+        {
+            panic!("cannot split a milestone with pending proof or breach reports");
+        }
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKeyExt3, u32>(&DataKeyExt3::DeliveredQuantity(
+                shipment_id.clone(),
+                milestone_index,
+            ))
+            .unwrap_or(0)
+            > 0
+            || env
+                .storage()
+                .persistent()
+                .get::<DataKeyExt3, i128>(&DataKeyExt3::PartialQtyReleased(
+                    shipment_id.clone(),
+                    milestone_index,
+                ))
+                .unwrap_or(0)
+                > 0
+        {
+            panic!("cannot split a milestone with quantity progress");
+        }
+        if let Some(purpose) = env
+            .storage()
+            .persistent()
+            .get::<DataKeyExt3, Symbol>(&DataKeyExt3::ShipmentOraclePurpose(
+                shipment_id.clone(),
+            ))
+        {
+            if env
+                .storage()
+                .persistent()
+                .has(&DataKeyExt3::OracleAttestations(
+                    shipment_id.clone(),
+                    milestone_index,
+                    purpose,
+                ))
+            {
+                panic!("cannot split a milestone with oracle attestations");
+            }
+        }
+    }
+
+    fn milestone_split_distribution(
+        env: &Env,
+        shipment_id: &String,
+        milestone_index: u32,
+        original_percent: u32,
+        parts: &Vec<MilestoneSplitPart>,
+    ) -> Option<Vec<u32>> {
+        let weights: Option<Vec<u32>> = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt::MilestoneSplits(shipment_id.clone()));
+        weights.map(|weights| {
+            if weights.len() == 0 || milestone_index >= weights.len() {
+                panic!("invalid milestone payout split configuration");
+            }
+            let mut result = Vec::new(env);
+            for i in 0..weights.len() {
+                if i == milestone_index {
+                    let apportioned = Self::apportion_split_weight(
+                        weights.get(i).unwrap(),
+                        original_percent,
+                        parts,
+                    );
+                    for weight in apportioned.iter() {
+                        result.push_back(weight);
+                    }
+                } else {
+                    result.push_back(weights.get(i).unwrap());
+                }
+            }
+            result
+        })
+    }
+
+    fn milestone_quantity_distribution(
+        env: &Env,
+        shipment_id: &String,
+        milestone_index: u32,
+        original_percent: u32,
+        parts: &Vec<MilestoneSplitPart>,
+    ) -> Option<Vec<u32>> {
+        let quantities: Option<Vec<u32>> = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt3::MilestoneQuantities(shipment_id.clone()));
+        quantities.map(|quantities| {
+            if quantities.len() == 0 || milestone_index >= quantities.len() {
+                panic!("invalid milestone quantity configuration");
+            }
+            let mut result = Vec::new(env);
+            for i in 0..quantities.len() {
+                if i == milestone_index {
+                    let original_quantity = quantities.get(i).unwrap();
+                    if original_quantity == 0 {
+                        for _ in 0..parts.len() {
+                            result.push_back(0);
+                        }
+                    } else {
+                        let apportioned = Self::apportion_split_weight(
+                            original_quantity,
+                            original_percent,
+                            parts,
+                        );
+                        for quantity in apportioned.iter() {
+                            result.push_back(quantity);
+                        }
+                    }
+                } else {
+                    result.push_back(quantities.get(i).unwrap());
+                }
+            }
+            result
+        })
+    }
+
+    fn apportion_split_weight(
+        original_weight: u32,
+        original_percent: u32,
+        parts: &Vec<MilestoneSplitPart>,
+    ) -> Vec<u32> {
+        let mut result = Vec::new(parts.env());
+        let mut cumulative_percent = 0u64;
+        let mut allocated = 0u32;
+        for (index, part) in parts.iter().enumerate() {
+            cumulative_percent += part.payment_percent as u64;
+            let next_allocated = if index as u32 + 1 == parts.len() {
+                original_weight
+            } else {
+                ((original_weight as u64 * cumulative_percent) / original_percent as u64) as u32
+            };
+            let allocation = next_allocated - allocated;
+            if allocation == 0 {
+                panic!("split part is too small for configured payout allocation");
+            }
+            result.push_back(allocation);
+            allocated = next_allocated;
+        }
+        result
+    }
+
+    fn shift_milestone_storage_up(
+        env: &Env,
+        shipment_id: &String,
+        first_index: u32,
+        old_len: u32,
+        shift: u32,
+    ) {
+        let mut source = old_len;
+        while source > first_index {
+            source -= 1;
+            let src_keys = Self::per_milestone_keys(env, shipment_id, source);
+            let dst_keys = Self::per_milestone_keys(env, shipment_id, source + shift);
+            for k in 0..src_keys.len() {
+                Self::move_storage_entry(
+                    env,
+                    Some(src_keys.get(k).unwrap()),
+                    dst_keys.get(k).unwrap(),
+                );
+            }
+        }
+    }
+
+    fn clear_milestone_storage(env: &Env, shipment_id: &String, index: u32) {
+        for key in Self::per_milestone_keys(env, shipment_id, index).iter() {
+            Self::move_storage_entry(env, None, key);
+        }
+    }
+
+    fn shift_active_disputes_up(env: &Env, shipment_id: &String, index: u32, shift: u32) {
+        let disputes: Vec<DisputeEntry> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveDisputes)
+            .unwrap_or_else(|| Vec::new(env));
+        let mut shifted: Vec<DisputeEntry> = Vec::new(env);
+        for mut entry in disputes.iter() {
+            if entry.shipment_id == *shipment_id && entry.milestone_index > index {
+                entry.milestone_index += shift;
+            }
+            shifted.push_back(entry);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveDisputes, &shifted);
+    }
+
     /// Returns the pending milestone merge proposal for a shipment, if any.
     pub fn get_milestone_merge_proposal(
         env: Env,
@@ -3479,7 +4098,26 @@ impl ChainSettleContract {
         keys.push_back(DataKeyExt2::DisputeResolutionReason(s.clone(), idx).into_val(env));
         keys.push_back(DataKeyExt2::ExtensionRequestCount(s.clone(), idx).into_val(env));
         keys.push_back(DataKeyExt3::RefundClaimableAtLedger(s.clone(), idx).into_val(env));
-        keys.push_back(DataKeyExt3::DisputeRaisedBy(s, idx).into_val(env));
+        keys.push_back(DataKeyExt3::DisputeRaisedBy(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt3::MilestoneGrade(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt3::PendingGrade(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt3::GradeDispute(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt3::DeliveredQuantity(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt3::PartialQtyReleased(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt3::InspectionReport(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt3::PendingDualProof(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt3::ConditionBreachReports(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt4::SubstituteProposal(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt4::MilestoneSupplier(s.clone(), idx).into_val(env));
+        if let Some(purpose) = env
+            .storage()
+            .persistent()
+            .get::<DataKeyExt3, Symbol>(&DataKeyExt3::ShipmentOraclePurpose(s.clone()))
+        {
+            keys.push_back(
+                DataKeyExt3::OracleAttestations(s.clone(), idx, purpose).into_val(env),
+            );
+        }
         keys
     }
 
@@ -12200,7 +12838,7 @@ impl ChainSettleContract {
     pub fn get_arbiter_stake(env: Env, arbiter: Address) -> i128 {
         env.storage()
             .persistent()
-            .get::<DataKeyExt3, (Address, i128)>(&DataKeyExt3::ArbiterStake(arbiter))
+            .get::<DataKeyExt4, (Address, i128)>(&DataKeyExt3::ArbiterStake(arbiter))
             .map(|(_, amt)| amt)
             .unwrap_or(0)
     }
@@ -14668,7 +15306,7 @@ impl ChainSettleContract {
         let supplier = env
             .storage()
             .persistent()
-            .get::<DataKeyExt3, Address>(&DataKeyExt3::MilestoneSupplier(
+            .get::<DataKeyExt4, Address>(&DataKeyExt3::MilestoneSupplier(
                 shipment_id.clone(),
                 milestone_index,
             ))
@@ -15689,7 +16327,7 @@ impl ChainSettleContract {
         let Some((stake_token, stake_amt)) = env
             .storage()
             .persistent()
-            .get::<DataKeyExt3, (Address, i128)>(&stake_key)
+            .get::<DataKeyExt4, (Address, i128)>(&stake_key)
         else {
             return;
         };
@@ -15960,7 +16598,7 @@ impl ChainSettleContract {
     }
 
     /// Append a shipment ID to a party index (`ArbiterShipments` / `LogisticsShipments`).
-    fn add_to_party_index(env: &Env, key: DataKeyExt3, shipment_id: &String) {
+    fn add_to_party_index<K: IntoVal<Env, Val>>(env: &Env, key: K, shipment_id: &String) {
         let mut list: Vec<String> = env
             .storage()
             .persistent()
@@ -15982,7 +16620,7 @@ impl ChainSettleContract {
     }
 
     /// Remove the first matching shipment ID from a party index.
-    fn remove_from_party_index(env: &Env, key: DataKeyExt3, shipment_id: &String) {
+    fn remove_from_party_index<K: IntoVal<Env, Val>>(env: &Env, key: K, shipment_id: &String) {
         let list: Vec<String> = env
             .storage()
             .persistent()
@@ -17762,6 +18400,7 @@ mod test_arbiter_repetition_guard;
 mod test_trade_proof;
 mod test_pause_notice;
 mod test_buyer_cap_collateral_merge;
+mod test_milestone_split;
 mod test_feat_issues;
 // Disabled: exercises milestone insurance holdback / oracle price-condition
 // APIs (see NEW_MILESTONE_FEATURES.md) that have not been implemented yet.
