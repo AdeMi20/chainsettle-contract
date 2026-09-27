@@ -2408,3 +2408,127 @@ Function | Who | Behaviour
 `report_condition_breach(oracle, shipment_id, milestone_index, data_hash)` | Group member | Records the report, emits `condition_breach_reported`, appends an audit entry. Duplicate reports from the same oracle are ignored. When distinct reports reach the group threshold, a dispute opens automatically on the milestone.
 
 Non-group callers are rejected. Threshold gating ensures a dispute opens only after enough distinct reports.
+---
+
+## Emergency Recovery
+
+A delayed, cancellable two-step process to recover stuck escrow funds. Admin proposes recovery, waits for a configurable delay, then executes. Can be cancelled during the delay window.
+
+### Functions
+
+| Function | Who | Description |
+|----------|-----|-------------|
+| `set_recovery_delay(admin, ledgers)` | Admin | Sets the delay period in ledgers before recovery can execute. Default: 0 (disabled). |
+| `propose_emergency_recover(admin, shipment_id)` | Admin | Proposes recovery for a stuck shipment. Starts the delay timer. |
+| `execute_emergency_recover(admin, shipment_id)` | Admin | Executes recovery after delay has passed. Releases escrow to appropriate party. |
+| `cancel_emergency_recover(admin, shipment_id)` | Admin | Cancels a pending recovery before execution. |
+| `get_pending_recovery(shipment_id) → Option` | Anyone | Returns pending recovery info if one exists, otherwise None. |
+
+### Example
+
+```bash
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --source admin-account \
+  --network testnet \
+  -- propose_emergency_recover \
+  --admin <ADMIN> \
+  --shipment_id "SHIP-001"
+```
+
+---
+
+## Buyer Spending Limits
+
+Admins can cap how much escrow a buyer may commit within a rolling ledger window. Helps prevent over-commitment by individual buyers.
+
+### Functions
+
+| Function | Who | Description |
+|----------|-----|-------------|
+| `set_buyer_spending_limit(admin, buyer, limit, window_ledgers)` | Admin | Sets spending cap (`limit`) and rolling window (`window_ledgers`) for a buyer. |
+| `get_buyer_spending_limit(buyer) → Option<(i128, u32)>` | Anyone | Returns the buyer's limit and window, or None if not set. |
+| `get_buyer_spending_window_usage(buyer) → i128` | Anyone | Returns the buyer's current window usage (total committed in current window). |
+
+### Default Values
+
+- `limit = 0`: No limit enforced
+- `window_ledgers = 0`: Window disabled
+
+### Example
+
+```bash
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --source admin-account \
+  --network testnet \
+  -- set_buyer_spending_limit \
+  --admin <ADMIN> \
+  --buyer <BUYER> \
+  --limit 1000000000 \
+  --window_ledgers 1000
+```
+
+---
+
+## Refund Sweep
+
+Admins can sweep deadline refunds that buyers never claimed to the treasury after a configurable window.
+
+### Functions
+
+| Function | Who | Description |
+|----------|-----|-------------|
+| `set_refund_sweep_window(admin, ledgers)` | Admin | Sets the sweep window in ledgers after refund becomes claimable. |
+| `get_refund_sweep_window() → u32` | Anyone | Returns the configured sweep window. |
+| `mark_refund_claimable(shipment_id, milestone_index)` | Anyone | Marks a milestone's refund as claimable by buyer. |
+| `sweep_unclaimed_refund(admin, shipment_id, milestone_index)` | Admin | Sweeps unclaimed refund to treasury after sweep window elapses. |
+
+### Default Values
+
+- `ledgers = 0`: Sweep disabled
+
+### Example
+
+```bash
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --source admin-account \
+  --network testnet \
+  -- set_refund_sweep_window \
+  --admin <ADMIN> \
+  --ledgers 500
+```
+
+---
+
+## Proof Hash Validation
+
+Admins can enforce length bounds and a required prefix on proof hashes submitted by suppliers/logistics.
+
+### Functions
+
+| Function | Who | Description |
+|----------|-----|-------------|
+| `set_proof_hash_length_bounds(admin, min_len, max_len)` | Admin | Sets minimum and maximum allowed proof hash length. |
+| `get_proof_hash_length_bounds() → (u32, u32)` | Anyone | Returns (min_len, max_len). |
+| `set_proof_hash_required_prefix(admin, prefix)` | Admin | Sets required prefix (e.g., "ipfs://"). |
+| `get_proof_hash_required_prefix() → String` | Anyone | Returns the required prefix, or empty if none set. |
+
+### Default Values
+
+- `min_len = 0, max_len = 0`: No bounds enforced
+- `prefix = ""`: No prefix required
+
+### Example
+
+```bash
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --source admin-account \
+  --network testnet \
+  -- set_proof_hash_length_bounds \
+  --admin <ADMIN> \
+  --min_len 32 \
+  --max_len 128
+```
