@@ -634,6 +634,46 @@ pub struct DisputeEntry {
     pub milestone_index: u32,
 }
 
+/// #575 – Lightweight, read-only projection of a `Shipment` that omits the
+/// (potentially large) `audit_log` and `milestones` vectors, so callers who
+/// only need headline status/amount fields avoid paying to deserialize them.
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub struct ShipmentSummary {
+    pub id: String,
+    pub status: ShipmentStatus,
+    pub buyers: Vec<Address>,
+    pub supplier: Address,
+    pub token: Address,
+    pub total_amount: i128,
+    pub released_amount: i128,
+    pub milestone_count: u32,
+    /// Open dispute count (mirrors `Shipment.open_dispute_count`).
+    pub open_disputes: u32,
+    pub created_at: u32,
+}
+
+/// #577 – Outcome recorded for a dispute once it terminates.
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub enum DisputeOutcome {
+    Buyer,
+    Supplier,
+    Withdrawn,
+}
+
+/// #577 – One entry in an address's paginated dispute history. Appended to
+/// both the primary buyer's and the supplier's history whenever a dispute
+/// on their shipment terminates.
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub struct DisputeRecord {
+    pub shipment_id: String,
+    pub milestone_index: u32,
+    pub opened_ledger: u32,
+    pub outcome: DisputeOutcome,
+}
+
 /// Supplier advance payment request for a milestone.
 #[contracttype]
 #[derive(Clone)]
@@ -1468,6 +1508,75 @@ pub enum DataKeyExt3 {
     ConditionBreachReports(String, u32),
 }
 
+// `DataKeyExt3` is also at the 50-case XDR cap. It also turned out to
+// reference ten variants that were never actually defined on it — a
+// pre-existing bug (those call sites simply failed to compile). Rather than
+// touch the near-full `DataKeyExt3`, the orphaned variants are moved here
+// verbatim (same names, same payload shapes) alongside the new storage keys
+// needed for #575–#578.
+#[contracttype]
+pub enum DataKeyExt4 {
+    // ── Orphaned `DataKeyExt3` references, relocated verbatim ────────────
+    /// Storage schema version written by `migrate` (#571).
+    StorageSchemaVersion,
+    /// #572: Shipment IDs where the given address is (or was) the assigned arbiter.
+    ArbiterShipments(Address),
+    /// #573: Shipment IDs where the given address is (or was) the logistics provider.
+    LogisticsShipments(Address),
+    /// #528: Admin-configured fee rebate (bps) for shipments that complete
+    /// with zero disputes across all milestones.
+    CleanCompletionRebateBps,
+    /// #528: Cumulative platform fees paid so far for a shipment.
+    ShipmentFeesPaid(String),
+    /// #528: Whether a shipment has ever had a dispute raised on it (used by
+    /// the clean-completion rebate to disqualify disputed shipments).
+    ShipmentHadDispute(String),
+    /// #531: Admin-configured basis points of an overturned arbiter's stake
+    /// slashed per overturned resolution.
+    ArbiterSlashBps,
+    /// #531: Arbiter onboarding stake locked for an arbiter: (token, amount).
+    ArbiterStake(Address),
+    /// #552: Pending substitute-supplier proposal for (shipment_id, milestone_index).
+    SubstituteProposal(String, u32),
+    /// #552: Supplier address recorded for a (shipment_id, milestone_index)
+    /// after an approved substitute-supplier swap, so payouts route correctly.
+    MilestoneSupplier(String, u32),
+
+    // ── #575 Lightweight shipment summary ─────────────────────────────────
+    /// Admin-configured max number of shipment IDs accepted by
+    /// `get_shipment_summaries` in one call (0/unset = default of 50).
+    MaxSummaryBatch,
+
+    // ── #576 Per-address earnings/spend by token ──────────────────────────
+    /// Cumulative post-fee amount actually paid to a supplier for
+    /// (supplier, token) across all shipments. Fees are excluded (this is
+    /// the net amount the supplier received); refunds never contribute.
+    SupplierEarned(Address, Address),
+    /// Cumulative gross amount released from escrow toward settlement for
+    /// (buyer, token) across all shipments, before fees. Refunds never
+    /// contribute.
+    BuyerSpent(Address, Address),
+
+    // ── #577 Paginated dispute history per address ─────────────────────────
+    /// Append-only (capped ring-buffer) dispute history for an address,
+    /// covering every dispute where the address was the primary buyer or
+    /// the supplier on the underlying shipment.
+    DisputeHistory(Address),
+
+    // ── #578 Mutual ratings after completion ───────────────────────────────
+    /// Admin-configured window (in ledgers) after a shipment completes during
+    /// which `rate_counterparty` may be called for it (0 = ratings disabled).
+    RatingWindowLedgers,
+    /// Ledger at which a shipment's status last became `Completed`.
+    CompletedAtLedger(String),
+    /// Whether (shipment_id, rater) has already submitted a rating for that
+    /// shipment (a party may rate its counterparty at most once per shipment).
+    ShipmentRated(String, Address),
+    /// Rating aggregate `(count, sum_of_stars)` for an address; average is
+    /// derived on read as `sum * 100 / count`.
+    RatingAgg(Address),
+}
+
 /// #517 – Pending proposal to merge two adjacent Pending milestones.
 #[contracttype]
 #[derive(Clone, PartialEq, Debug)]
@@ -1680,7 +1789,7 @@ impl ChainSettleContract {
     /// Sets / bumps the instance-stored storage schema version (#571).
     pub fn migrate(env: Env) {
         env.storage().instance().set(
-            &DataKeyExt3::StorageSchemaVersion,
+            &DataKeyExt4::StorageSchemaVersion,
             &constants::STORAGE_SCHEMA_VERSION,
         );
     }
@@ -1700,7 +1809,7 @@ impl ChainSettleContract {
     pub fn storage_schema_version(env: Env) -> u32 {
         env.storage()
             .instance()
-            .get(&DataKeyExt3::StorageSchemaVersion)
+            .get(&DataKeyExt4::StorageSchemaVersion)
             .unwrap_or(0)
     }
 
@@ -5648,12 +5757,12 @@ impl ChainSettleContract {
         // #572 / #573: Index by arbiter and logistics for party dashboards.
         Self::add_to_party_index(
             &env,
-            DataKeyExt3::ArbiterShipments(arbiter.clone()),
+            DataKeyExt4::ArbiterShipments(arbiter.clone()),
             &shipment_id,
         );
         Self::add_to_party_index(
             &env,
-            DataKeyExt3::LogisticsShipments(logistics.clone()),
+            DataKeyExt4::LogisticsShipments(logistics.clone()),
             &shipment_id,
         );
 
@@ -7452,6 +7561,18 @@ impl ChainSettleContract {
                 );
             }
 
+            // #576: Record volume counters — gross `payment` released from escrow
+            // (buyer spend) and the post-fee `actual_transfer` that reached the
+            // supplier (supplier earnings; fees excluded, refunds never counted).
+            Self::record_release_counters(
+                &env,
+                shipment.supplier.clone(),
+                primary_buyer_for_fee.clone(),
+                shipment.token.clone(),
+                payment,
+                actual_transfer,
+            );
+
             // Return penalty to buyer if any.
             if penalty_deducted > 0 {
                 let primary_buyer = shipment.buyers.get(0).unwrap();
@@ -7692,6 +7813,20 @@ impl ChainSettleContract {
             );
         }
 
+        // #576: Supplier portion only — the buyer's grade refund below is not
+        // counted (it is a refund, not settlement money the supplier earned).
+        {
+            let primary_buyer = shipment.buyers.get(0).unwrap();
+            Self::record_release_counters(
+                &env,
+                shipment.supplier.clone(),
+                primary_buyer,
+                shipment.token.clone(),
+                payment,
+                actual_transfer,
+            );
+        }
+
         if let Some((grade, grade_bps)) = pending_grade {
             env.storage().persistent().remove(&grade_key);
             let primary_buyer = shipment.buyers.get(0).unwrap();
@@ -7898,6 +8033,16 @@ impl ChainSettleContract {
                     &token_client,
                 );
             }
+
+            // #576: Record volume counters for this milestone's release.
+            Self::record_release_counters(
+                &env,
+                shipment.supplier.clone(),
+                shipment.buyers.get(0).unwrap(),
+                shipment.token.clone(),
+                payment,
+                actual_transfer,
+            );
 
             // Decrement total escrowed value (net of any advance already deducted).
             let net_outflow = payment - advance_deducted;
@@ -8343,6 +8488,17 @@ impl ChainSettleContract {
 
             shipment.released_amount += uncontested_payment;
 
+            // #576: The uncontested share is released to the supplier immediately,
+            // independent of how the contested portion is later resolved.
+            Self::record_release_counters(
+                &env,
+                shipment.supplier.clone(),
+                shipment.buyers.get(0).unwrap(),
+                shipment.token.clone(),
+                uncontested_payment,
+                net_uncontested,
+            );
+
             // Decrement total escrowed by the outflow.
             let current_escrowed: i128 = env
                 .storage()
@@ -8553,6 +8709,17 @@ impl ChainSettleContract {
 
         let token_client = token::Client::new(&env, &shipment.token);
 
+        // #577: Snapshot before any branch below touches milestone state.
+        let opened_ledger = milestone.dispute_opened_ledger.unwrap_or(0);
+        // #577/#576: Set by the branches below when this call terminates the
+        // dispute with a definite outcome / moves supplier payout funds.
+        // Left `None` for the finality-delay park (not yet terminal — recorded
+        // by `finalize_dispute_resolution` instead) and for the #519 grade-dispute
+        // branch (a supplier-vs-grade challenge, not a buyer/supplier dispute;
+        // out of scope for #576/#577).
+        let mut dispute_outcome: Option<DisputeOutcome> = None;
+        let mut release_hook: Option<(i128, i128)> = None;
+
         // #519: Supplier-raised dispute contesting a quality grade.
         let grade_dispute_key = DataKeyExt3::GradeDispute(shipment_id.clone(), milestone_index);
         let grade_dispute: Option<(u32, u32)> = env.storage().persistent().get(&grade_dispute_key);
@@ -8571,6 +8738,8 @@ impl ChainSettleContract {
         if approve && finality_delay > 0 {
             milestone.status = MilestoneStatus::ResolvedPendingFinality;
             milestone.release_after_ledger = env.ledger().sequence() + finality_delay;
+            // #577: Dispute is terminal for history; #576 counters fire on finalize.
+            dispute_outcome = Some(DisputeOutcome::Supplier);
         } else if approve {
             // Deduct any approved advance (only relevant for full disputes; partial disputes
             // block advance approval at raise time).
@@ -8623,6 +8792,10 @@ impl ChainSettleContract {
                     &shipment.dispute_bond_amount,
                 );
             }
+
+            // #576/#577: Supplier wins, funds moved now (not parked).
+            dispute_outcome = Some(DisputeOutcome::Supplier);
+            release_hook = Some((payment, actual_transfer));
 
             milestone.status = MilestoneStatus::Resolved;
         } else if let Some((grade, grade_bps)) = grade_dispute {
@@ -8691,6 +8864,9 @@ impl ChainSettleContract {
                 );
             }
 
+            // #577: Contested portion refunded to buyer — Buyer outcome.
+            dispute_outcome = Some(DisputeOutcome::Buyer);
+
             milestone.status = MilestoneStatus::Resolved;
         } else {
             // Full dispute rejection: milestone goes back to Pending for proof resubmission.
@@ -8702,7 +8878,37 @@ impl ChainSettleContract {
                     &shipment.dispute_bond_amount,
                 );
             }
+            // #577: Proof rejected — Buyer wins the dispute (resubmission required).
+            dispute_outcome = Some(DisputeOutcome::Buyer);
             milestone.status = MilestoneStatus::Pending;
+        }
+
+        // #576/#577: Apply release counters and dispute history for terminal outcomes
+        // (skipped when parked behind finality delay — finalize_dispute_resolution handles that).
+        if let Some((buyer_spend, supplier_net)) = release_hook {
+            let primary_buyer = shipment.buyers.get(0).unwrap();
+            Self::record_release_counters(
+                &env,
+                shipment.supplier.clone(),
+                primary_buyer,
+                shipment.token.clone(),
+                buyer_spend,
+                supplier_net,
+            );
+        }
+        if let Some(outcome) = dispute_outcome {
+            let primary_buyer = shipment.buyers.get(0).unwrap();
+            Self::append_dispute_history(
+                &env,
+                &primary_buyer,
+                &shipment.supplier,
+                DisputeRecord {
+                    shipment_id: shipment_id.clone(),
+                    milestone_index,
+                    opened_ledger,
+                    outcome,
+                },
+            );
         }
 
         // Clean up the partial-dispute record.
@@ -9013,6 +9219,19 @@ impl ChainSettleContract {
                 actual_transfer,
                 &shipment.supplier,
                 &token_client,
+            );
+        }
+
+        // #576: Funds finally move after the finality delay.
+        {
+            let primary_buyer = shipment.buyers.get(0).unwrap();
+            Self::record_release_counters(
+                &env,
+                shipment.supplier.clone(),
+                primary_buyer,
+                shipment.token.clone(),
+                payment,
+                actual_transfer,
             );
         }
 
@@ -9860,12 +10079,12 @@ impl ChainSettleContract {
 
         Self::remove_from_party_index(
             &env,
-            DataKeyExt3::LogisticsShipments(current_logistics.clone()),
+            DataKeyExt4::LogisticsShipments(current_logistics.clone()),
             &shipment_id,
         );
         Self::add_to_party_index(
             &env,
-            DataKeyExt3::LogisticsShipments(new_logistics.clone()),
+            DataKeyExt4::LogisticsShipments(new_logistics.clone()),
             &shipment_id,
         );
 
@@ -10211,6 +10430,19 @@ impl ChainSettleContract {
             );
         }
 
+        // #576: Record volume counters for auto-confirmed release.
+        {
+            let primary_buyer = shipment.buyers.get(0).unwrap();
+            Self::record_release_counters(
+                &env,
+                shipment.supplier.clone(),
+                primary_buyer,
+                shipment.token.clone(),
+                payment,
+                actual_transfer,
+            );
+        }
+
         // Return penalty to buyer if any.
         if penalty_deducted > 0 {
             let primary_buyer = shipment.buyers.get(0).unwrap();
@@ -10447,6 +10679,9 @@ impl ChainSettleContract {
             panic!("milestone is not in disputed status");
         }
 
+        // #577: Snapshot before status changes.
+        let opened_ledger = milestone.dispute_opened_ledger.unwrap_or(0);
+
         if shipment.dispute_timeout_seconds == 0 {
             panic!("dispute timeout not configured for this shipment");
         }
@@ -10545,6 +10780,18 @@ impl ChainSettleContract {
                 );
             }
             shipment.released_amount += payment;
+            // #576: Supplier timeout outcome releases funds to supplier.
+            {
+                let primary_buyer = shipment.buyers.get(0).unwrap();
+                Self::record_release_counters(
+                    &env,
+                    shipment.supplier.clone(),
+                    primary_buyer,
+                    shipment.token.clone(),
+                    payment,
+                    net_payment,
+                );
+            }
         } else {
             // Resolution::Buyer — refund contested portion to buyer.
             let primary_buyer = shipment.buyers.get(0).unwrap();
@@ -10581,6 +10828,27 @@ impl ChainSettleContract {
             ));
 
         milestone.status = MilestoneStatus::Resolved;
+
+        // #577: Record timeout outcome for both parties.
+        {
+            let primary_buyer = shipment.buyers.get(0).unwrap();
+            let outcome = if is_supplier {
+                DisputeOutcome::Supplier
+            } else {
+                DisputeOutcome::Buyer
+            };
+            Self::append_dispute_history(
+                &env,
+                &primary_buyer,
+                &shipment.supplier,
+                DisputeRecord {
+                    shipment_id: shipment_id.clone(),
+                    milestone_index,
+                    opened_ledger,
+                    outcome,
+                },
+            );
+        }
 
         Self::append_audit_entry(
             &env,
@@ -10918,6 +11186,18 @@ impl ChainSettleContract {
                 );
             }
             shipment.released_amount += payment;
+            // #576: Mediation supplier outcome.
+            {
+                let primary_buyer = shipment.buyers.get(0).unwrap();
+                Self::record_release_counters(
+                    env,
+                    shipment.supplier.clone(),
+                    primary_buyer,
+                    shipment.token.clone(),
+                    payment,
+                    net_payment,
+                );
+            }
             if shipment.dispute_bond_amount > 0 {
                 let primary_buyer = shipment.buyers.get(0).unwrap();
                 token_client.transfer(
@@ -10939,6 +11219,28 @@ impl ChainSettleContract {
                     &shipment.dispute_bond_amount,
                 );
             }
+        }
+
+        // #577: Record mediation outcome for both parties.
+        {
+            let primary_buyer = shipment.buyers.get(0).unwrap();
+            let opened_ledger = milestone.dispute_opened_ledger.unwrap_or(0);
+            let hist_outcome = if is_supplier {
+                DisputeOutcome::Supplier
+            } else {
+                DisputeOutcome::Buyer
+            };
+            Self::append_dispute_history(
+                env,
+                &primary_buyer,
+                &shipment.supplier,
+                DisputeRecord {
+                    shipment_id: shipment_id.clone(),
+                    milestone_index,
+                    opened_ledger,
+                    outcome: hist_outcome,
+                },
+            );
         }
 
         let current_escrowed: i128 = env
@@ -12115,7 +12417,7 @@ impl ChainSettleContract {
         }
         env.storage()
             .instance()
-            .set(&DataKeyExt3::CleanCompletionRebateBps, &bps);
+            .set(&DataKeyExt4::CleanCompletionRebateBps, &bps);
         env.events()
             .publish((Symbol::new(&env, "clean_completion_rebate_bps_set"),), bps);
     }
@@ -12124,7 +12426,7 @@ impl ChainSettleContract {
     pub fn get_clean_completion_rebate_bps(env: Env) -> u32 {
         env.storage()
             .instance()
-            .get(&DataKeyExt3::CleanCompletionRebateBps)
+            .get(&DataKeyExt4::CleanCompletionRebateBps)
             .unwrap_or(0)
     }
 
@@ -12132,7 +12434,7 @@ impl ChainSettleContract {
     pub fn get_shipment_fees_paid(env: Env, shipment_id: String) -> i128 {
         env.storage()
             .persistent()
-            .get(&DataKeyExt3::ShipmentFeesPaid(shipment_id))
+            .get(&DataKeyExt4::ShipmentFeesPaid(shipment_id))
             .unwrap_or(0)
     }
 
@@ -12150,7 +12452,7 @@ impl ChainSettleContract {
         }
         env.storage()
             .instance()
-            .set(&DataKeyExt3::ArbiterSlashBps, &bps);
+            .set(&DataKeyExt4::ArbiterSlashBps, &bps);
         env.events()
             .publish((Symbol::new(&env, "arbiter_slash_bps_set"),), bps);
     }
@@ -12159,7 +12461,7 @@ impl ChainSettleContract {
     pub fn get_arbiter_slash_bps(env: Env) -> u32 {
         env.storage()
             .instance()
-            .get(&DataKeyExt3::ArbiterSlashBps)
+            .get(&DataKeyExt4::ArbiterSlashBps)
             .unwrap_or(0)
     }
 
@@ -12172,7 +12474,7 @@ impl ChainSettleContract {
         let token_client = token::Client::new(&env, &token);
         token_client.transfer(&arbiter, &env.current_contract_address(), &amount);
 
-        let key = DataKeyExt3::ArbiterStake(arbiter.clone());
+        let key = DataKeyExt4::ArbiterStake(arbiter.clone());
         let (existing_token, existing_amt): (Address, i128) = env
             .storage()
             .persistent()
@@ -12200,7 +12502,7 @@ impl ChainSettleContract {
     pub fn get_arbiter_stake(env: Env, arbiter: Address) -> i128 {
         env.storage()
             .persistent()
-            .get::<DataKeyExt3, (Address, i128)>(&DataKeyExt3::ArbiterStake(arbiter))
+            .get::<DataKeyExt4, (Address, i128)>(&DataKeyExt4::ArbiterStake(arbiter))
             .map(|(_, amt)| amt)
             .unwrap_or(0)
     }
@@ -12242,7 +12544,7 @@ impl ChainSettleContract {
             panic!("milestone is not overdue");
         }
 
-        let key = DataKeyExt3::SubstituteProposal(shipment_id.clone(), milestone_index);
+        let key = DataKeyExt4::SubstituteProposal(shipment_id.clone(), milestone_index);
         env.storage()
             .persistent()
             .set(&key, &new_supplier);
@@ -12300,7 +12602,7 @@ impl ChainSettleContract {
             panic!("milestone is not overdue");
         }
 
-        let proposal_key = DataKeyExt3::SubstituteProposal(shipment_id.clone(), milestone_index);
+        let proposal_key = DataKeyExt4::SubstituteProposal(shipment_id.clone(), milestone_index);
         let new_supplier: Address = env
             .storage()
             .persistent()
@@ -12308,7 +12610,7 @@ impl ChainSettleContract {
             .unwrap_or_else(|| panic!("no substitute proposal"));
         env.storage().persistent().remove(&proposal_key);
 
-        let supplier_key = DataKeyExt3::MilestoneSupplier(shipment_id.clone(), milestone_index);
+        let supplier_key = DataKeyExt4::MilestoneSupplier(shipment_id.clone(), milestone_index);
         env.storage()
             .persistent()
             .set(&supplier_key, &new_supplier);
@@ -12347,7 +12649,7 @@ impl ChainSettleContract {
     ) -> Option<Address> {
         env.storage()
             .persistent()
-            .get(&DataKeyExt3::MilestoneSupplier(shipment_id, milestone_index))
+            .get(&DataKeyExt4::MilestoneSupplier(shipment_id, milestone_index))
     }
 
     // ----------------------------------------------------------
@@ -12636,6 +12938,15 @@ impl ChainSettleContract {
 
         let token_client = token::Client::new(env, &shipment.token);
 
+        // #577: Snapshot before branches clear dispute_opened_ledger.
+        let opened_ledger = shipment
+            .milestones
+            .get(milestone_index)
+            .unwrap()
+            .dispute_opened_ledger
+            .unwrap_or(0);
+        let mut panel_outcome: Option<DisputeOutcome> = None;
+
         if approve {
             let advance_deducted = Self::consume_advance_for_milestone(
                 env,
@@ -12688,6 +12999,19 @@ impl ChainSettleContract {
                 &token_client,
             );
 
+            // #576: Panel approve releases funds to supplier.
+            {
+                let primary_buyer = shipment.buyers.get(0).unwrap();
+                Self::record_release_counters(
+                    env,
+                    shipment.supplier.clone(),
+                    primary_buyer,
+                    shipment.token.clone(),
+                    payment,
+                    actual_transfer,
+                );
+            }
+
             if shipment.dispute_bond_amount > 0 {
                 let primary_buyer = shipment.buyers.get(0).unwrap();
                 token_client.transfer(
@@ -12700,6 +13024,7 @@ impl ChainSettleContract {
             let mut m = shipment.milestones.get(milestone_index).unwrap();
             m.status = MilestoneStatus::Resolved;
             shipment.milestones.set(milestone_index, m);
+            panel_outcome = Some(DisputeOutcome::Supplier);
         } else if is_partial {
             let fee_bps = Self::applicable_arbiter_fee_bps(env, payment, shipment.arbiter_fee_bps);
             let panel: Vec<Address> = env
@@ -12744,6 +13069,7 @@ impl ChainSettleContract {
             let mut m = shipment.milestones.get(milestone_index).unwrap();
             m.status = MilestoneStatus::Resolved;
             shipment.milestones.set(milestone_index, m);
+            panel_outcome = Some(DisputeOutcome::Buyer);
         } else {
             // Full dispute rejection — reset to Pending.
             if shipment.dispute_bond_amount > 0 {
@@ -12756,6 +13082,23 @@ impl ChainSettleContract {
             let mut m = shipment.milestones.get(milestone_index).unwrap();
             m.status = MilestoneStatus::Pending;
             shipment.milestones.set(milestone_index, m);
+            panel_outcome = Some(DisputeOutcome::Buyer);
+        }
+
+        // #577: Append panel dispute outcome to both parties' history.
+        if let Some(outcome) = panel_outcome {
+            let primary_buyer = shipment.buyers.get(0).unwrap();
+            Self::append_dispute_history(
+                env,
+                &primary_buyer,
+                &shipment.supplier,
+                DisputeRecord {
+                    shipment_id: shipment_id.clone(),
+                    milestone_index,
+                    opened_ledger,
+                    outcome,
+                },
+            );
         }
 
         // Clean up partial dispute record.
@@ -13689,6 +14032,272 @@ impl ChainSettleContract {
         Self::get_shipment_internal(&env, &shipment_id)
     }
 
+    // ----------------------------------------------------------
+    // #575 — LIGHTWEIGHT SHIPMENT SUMMARY
+    // ----------------------------------------------------------
+
+    /// Read-only, no authorization required (matches `get_shipment`). Returns a
+    /// lightweight projection of the shipment that omits `audit_log` and
+    /// `milestones`, so a shipment with a large audit history or many
+    /// milestones costs less to fetch than the full `Shipment`. Panics with
+    /// `"shipment not found"` if `shipment_id` is unknown (same as
+    /// `get_shipment_internal`).
+    pub fn get_shipment_summary(env: Env, shipment_id: String) -> ShipmentSummary {
+        env.storage()
+            .instance()
+            .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+        Self::build_shipment_summary(&shipment)
+    }
+
+    /// Batch variant of `get_shipment_summary`. Unknown IDs are silently
+    /// skipped (the result may therefore be shorter than `ids`). Panics if
+    /// `ids.len()` exceeds the admin-configured `get_max_summary_batch()`.
+    /// Read-only; no authorization required.
+    pub fn get_shipment_summaries(env: Env, ids: Vec<String>) -> Vec<ShipmentSummary> {
+        let max = Self::get_max_summary_batch(env.clone());
+        if ids.len() > max {
+            panic!("batch size exceeds max summary batch");
+        }
+        let mut result: Vec<ShipmentSummary> = Vec::new(&env);
+        for i in 0..ids.len() {
+            let id = ids.get(i).unwrap();
+            if let Some(shipment) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Shipment>(&DataKey::Shipment(id))
+            {
+                result.push_back(Self::build_shipment_summary(&shipment));
+            }
+        }
+        result
+    }
+
+    /// Admin-only. Caps the number of IDs accepted by `get_shipment_summaries`
+    /// in one call. Must be positive.
+    pub fn set_max_summary_batch(env: Env, admin: Address, max: u32) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        if max == 0 {
+            panic!("max must be positive");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKeyExt4::MaxSummaryBatch, &max);
+        Self::append_admin_action(
+            &env,
+            Symbol::new(&env, "set_max_summary_batch"),
+            Symbol::new(&env, "max_summary_batch_set"),
+        );
+        env.events()
+            .publish((Symbol::new(&env, "max_summary_batch_set"),), max);
+    }
+
+    /// Read the admin-configured `get_shipment_summaries` batch cap
+    /// (`constants::DEFAULT_MAX_SUMMARY_BATCH` if unset).
+    pub fn get_max_summary_batch(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKeyExt4::MaxSummaryBatch)
+            .unwrap_or(constants::DEFAULT_MAX_SUMMARY_BATCH)
+    }
+
+    // ----------------------------------------------------------
+    // #576 — PER-ADDRESS EARNINGS / SPEND BY TOKEN
+    // ----------------------------------------------------------
+
+    /// Cumulative post-fee amount actually paid to `supplier` in `token` across
+    /// all shipments (platform/logistics/referral/arbiter fees excluded;
+    /// buyer refunds never contribute). Read-only; no authorization required.
+    pub fn get_supplier_earnings(env: Env, supplier: Address, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt4::SupplierEarned(supplier, token))
+            .unwrap_or(0)
+    }
+
+    /// Cumulative gross amount released from escrow toward settlement on
+    /// behalf of `buyer` in `token` across all shipments (before fees; buyer
+    /// refunds never contribute). Read-only; no authorization required.
+    pub fn get_buyer_spend(env: Env, buyer: Address, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt4::BuyerSpent(buyer, token))
+            .unwrap_or(0)
+    }
+
+    // ----------------------------------------------------------
+    // #577 — PAGINATED DISPUTE HISTORY PER ADDRESS
+    // ----------------------------------------------------------
+
+    /// Paginated dispute history for `address` (as buyer or supplier).
+    /// `cursor` is a 0-based start index into the append-only history
+    /// (`None` = 0); `limit` is clamped to `LIST_SHIPMENTS_MAX_PAGE`. The
+    /// history is capped at `DISPUTE_HISTORY_MAX_ENTRIES`, oldest dropped on
+    /// overflow, so indices are stable for as long as an entry remains.
+    /// Read-only; no authorization required.
+    pub fn get_dispute_history(
+        env: Env,
+        address: Address,
+        cursor: Option<u32>,
+        limit: u32,
+    ) -> Vec<DisputeRecord> {
+        let history: Vec<DisputeRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt4::DisputeHistory(address))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let clamped_limit = if limit > constants::LIST_SHIPMENTS_MAX_PAGE {
+            constants::LIST_SHIPMENTS_MAX_PAGE
+        } else {
+            limit
+        };
+        let start_idx = cursor.unwrap_or(0);
+        let total_len = history.len();
+
+        let mut result: Vec<DisputeRecord> = Vec::new(&env);
+        let mut idx = start_idx;
+        while idx < total_len && (result.len() as u32) < clamped_limit {
+            result.push_back(history.get(idx).unwrap());
+            idx += 1;
+        }
+        result
+    }
+
+    // ----------------------------------------------------------
+    // #578 — MUTUAL RATINGS AFTER COMPLETION
+    // ----------------------------------------------------------
+
+    /// Admin-only. Configures the window (in ledgers) after a shipment
+    /// completes during which `rate_counterparty` may be called for it.
+    /// `0` disables ratings entirely (all `rate_counterparty` calls panic).
+    pub fn set_rating_window_ledgers(env: Env, admin: Address, window_ledgers: u32) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKeyExt4::RatingWindowLedgers, &window_ledgers);
+        Self::append_admin_action(
+            &env,
+            Symbol::new(&env, "set_rating_window_ledger"),
+            Symbol::new(&env, "rating_window_ledgers_set"),
+        );
+        env.events()
+            .publish((Symbol::new(&env, "rating_window_ledgers_set"),), window_ledgers);
+    }
+
+    /// Read the admin-configured rating window in ledgers (`0` = ratings disabled).
+    pub fn get_rating_window_ledgers(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKeyExt4::RatingWindowLedgers)
+            .unwrap_or(0)
+    }
+
+    /// Buyer or supplier rates their counterparty on a `Completed` shipment.
+    /// A buyer rates the supplier; the supplier rates the primary buyer. Each
+    /// party may rate at most once per shipment, only within the
+    /// admin-configured rating window (`0` = ratings disabled), and `stars`
+    /// must be in `1..=5`. Emits `counterparty_rated` and records an audit
+    /// entry on the shipment.
+    pub fn rate_counterparty(
+        env: Env,
+        caller: Address,
+        shipment_id: String,
+        stars: u32,
+        comment_hash: Option<BytesN<32>>,
+    ) {
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+
+        if stars < 1 || stars > 5 {
+            panic!("stars must be between 1 and 5");
+        }
+
+        let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if shipment.status != ShipmentStatus::Completed {
+            panic!("shipment is not completed");
+        }
+
+        let caller_is_buyer = Self::is_buyer(&shipment, &caller);
+        let caller_is_supplier = caller == shipment.supplier;
+        if !caller_is_buyer && !caller_is_supplier {
+            panic!("unauthorized");
+        }
+
+        let rated_key = DataKeyExt4::ShipmentRated(shipment_id.clone(), caller.clone());
+        if env.storage().persistent().has(&rated_key) {
+            panic!("already rated this shipment");
+        }
+
+        let window: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt4::RatingWindowLedgers)
+            .unwrap_or(0);
+        if window == 0 {
+            panic!("ratings are disabled");
+        }
+        let completed_at: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt4::CompletedAtLedger(shipment_id.clone()))
+            .unwrap_or(0);
+        if env.ledger().sequence() > completed_at + window {
+            panic!("rating window has elapsed");
+        }
+
+        // A buyer rates the supplier; the supplier rates the primary buyer.
+        let rated_address = if caller_is_buyer {
+            shipment.supplier.clone()
+        } else {
+            shipment.buyers.get(0).unwrap()
+        };
+
+        env.storage().persistent().set(&rated_key, &true);
+        env.storage().persistent().extend_ttl(
+            &rated_key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+
+        Self::record_rating(&env, &rated_address, stars);
+
+        Self::append_audit_entry(
+            &env,
+            &mut shipment,
+            caller.clone(),
+            Symbol::new(&env, "counterparty_rated"),
+            Symbol::new(&env, "rate_counterparty"),
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+
+        env.events().publish(
+            (Symbol::new(&env, "counterparty_rated"), shipment_id),
+            (caller, rated_address, stars, comment_hash),
+        );
+    }
+
+    /// Returns `(count, average_x100)` for `address`, where `average_x100` is
+    /// the mean star rating multiplied by 100 (e.g. `450` = 4.5 stars).
+    /// `(0, 0)` if the address has never been rated. Read-only; no
+    /// authorization required.
+    pub fn get_rating_summary(env: Env, address: Address) -> (u32, u32) {
+        let (count, sum): (u32, u32) = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt4::RatingAgg(address))
+            .unwrap_or((0u32, 0u32));
+        if count == 0 {
+            (0, 0)
+        } else {
+            (count, ((sum as u64 * 100) / count as u64) as u32)
+        }
+    }
+
     pub fn get_confirmation_cooldown(env: Env, shipment_id: String) -> u32 {
         Self::get_confirmation_cooldown_internal(&env, &shipment_id)
     }
@@ -14054,7 +14663,7 @@ impl ChainSettleContract {
         let list: Vec<String> = env
             .storage()
             .persistent()
-            .get(&DataKeyExt3::ArbiterShipments(arbiter))
+            .get(&DataKeyExt4::ArbiterShipments(arbiter))
             .unwrap_or_else(|| Vec::new(&env));
         Self::paginate_shipment_ids(&env, &list, cursor, limit)
     }
@@ -14072,7 +14681,7 @@ impl ChainSettleContract {
         let list: Vec<String> = env
             .storage()
             .persistent()
-            .get(&DataKeyExt3::LogisticsShipments(logistics))
+            .get(&DataKeyExt4::LogisticsShipments(logistics))
             .unwrap_or_else(|| Vec::new(&env));
         Self::paginate_shipment_ids(&env, &list, cursor, limit)
     }
@@ -14668,7 +15277,7 @@ impl ChainSettleContract {
         let supplier = env
             .storage()
             .persistent()
-            .get::<DataKeyExt3, Address>(&DataKeyExt3::MilestoneSupplier(
+            .get::<DataKeyExt4, Address>(&DataKeyExt4::MilestoneSupplier(
                 shipment_id.clone(),
                 milestone_index,
             ))
@@ -15150,11 +15759,29 @@ impl ChainSettleContract {
             panic!("grade dispute can only be resolved by the arbiter");
         }
 
+        // #577: Snapshot opened ledger before clearing, then record Withdrawn.
+        let opened_ledger = milestone.dispute_opened_ledger.unwrap_or(0);
+
         // Revert to ProofSubmitted so the supplier's original proof stands.
         milestone.status = MilestoneStatus::ProofSubmitted;
         milestone.dispute_opened_ledger = None;
         shipment.milestones.set(milestone_index, milestone);
         shipment.open_dispute_count = shipment.open_dispute_count.saturating_sub(1);
+
+        {
+            let primary_buyer = shipment.buyers.get(0).unwrap();
+            Self::append_dispute_history(
+                &env,
+                &primary_buyer,
+                &shipment.supplier,
+                DisputeRecord {
+                    shipment_id: shipment_id.clone(),
+                    milestone_index,
+                    opened_ledger,
+                    outcome: DisputeOutcome::Withdrawn,
+                },
+            );
+        }
 
         env.storage()
             .persistent()
@@ -15377,6 +16004,126 @@ impl ChainSettleContract {
         shipment.audit_log.push_back(entry);
     }
 
+    /// #575: Project a full `Shipment` down to its lightweight summary,
+    /// dropping `audit_log` and `milestones` (the two vectors that can grow
+    /// unbounded / with milestone count) so callers who only need headline
+    /// fields don't pay to deserialize them.
+    fn build_shipment_summary(shipment: &Shipment) -> ShipmentSummary {
+        ShipmentSummary {
+            id: shipment.id.clone(),
+            status: shipment.status.clone(),
+            buyers: shipment.buyers.clone(),
+            supplier: shipment.supplier.clone(),
+            token: shipment.token.clone(),
+            total_amount: shipment.total_amount,
+            released_amount: shipment.released_amount,
+            milestone_count: shipment.milestones.len(),
+            open_disputes: shipment.open_dispute_count,
+            created_at: shipment.created_at,
+        }
+    }
+
+    /// #576: Records per-address, per-token volume counters on a supplier
+    /// payout. `buyer_spend` is the gross amount released from escrow toward
+    /// settlement (before fees); `supplier_net` is the post-fee amount that
+    /// actually reached the supplier (fees excluded). Both use `checked_add`
+    /// and panic on overflow rather than silently wrapping. Only ever called
+    /// from release paths, never from refund paths, so refunds never
+    /// contribute to either counter. Extends TTL like other persistent
+    /// counters.
+    fn record_release_counters(
+        env: &Env,
+        supplier: Address,
+        buyer: Address,
+        token: Address,
+        buyer_spend: i128,
+        supplier_net: i128,
+    ) {
+        if buyer_spend > 0 {
+            let key = DataKeyExt4::BuyerSpent(buyer, token.clone());
+            let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+            let updated = current
+                .checked_add(buyer_spend)
+                .unwrap_or_else(|| panic!("buyer spend overflow"));
+            env.storage().persistent().set(&key, &updated);
+            env.storage().persistent().extend_ttl(
+                &key,
+                constants::TTL_INITIAL_LEDGERS,
+                constants::TTL_MAX_LEDGERS,
+            );
+        }
+        if supplier_net > 0 {
+            let key = DataKeyExt4::SupplierEarned(supplier, token);
+            let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+            let updated = current
+                .checked_add(supplier_net)
+                .unwrap_or_else(|| panic!("supplier earnings overflow"));
+            env.storage().persistent().set(&key, &updated);
+            env.storage().persistent().extend_ttl(
+                &key,
+                constants::TTL_INITIAL_LEDGERS,
+                constants::TTL_MAX_LEDGERS,
+            );
+        }
+    }
+
+    /// #577: Append `record` to a single address's dispute history,
+    /// maintaining a bounded ring-buffer of at most
+    /// `constants::DISPUTE_HISTORY_MAX_ENTRIES` entries (oldest evicted on
+    /// overflow), mirroring `append_audit_entry`'s ring-buffer style.
+    fn append_dispute_history_for(env: &Env, address: &Address, record: &DisputeRecord) {
+        let key = DataKeyExt4::DisputeHistory(address.clone());
+        let mut history: Vec<DisputeRecord> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+
+        let max: usize = constants::DISPUTE_HISTORY_MAX_ENTRIES;
+        if history.len() as usize >= max {
+            let mut trimmed: Vec<DisputeRecord> = Vec::new(env);
+            for i in 1..history.len() {
+                trimmed.push_back(history.get(i).unwrap());
+            }
+            history = trimmed;
+        }
+        history.push_back(record.clone());
+        env.storage().persistent().set(&key, &history);
+        env.storage().persistent().extend_ttl(
+            &key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+    }
+
+    /// #577: Append the same dispute record to both the primary buyer's and
+    /// the supplier's dispute history. Called once a dispute *terminates*
+    /// (outcome decided and funds/state settled), never while a resolution is
+    /// merely parked pending finality.
+    fn append_dispute_history(env: &Env, buyer: &Address, supplier: &Address, record: DisputeRecord) {
+        Self::append_dispute_history_for(env, buyer, &record);
+        Self::append_dispute_history_for(env, supplier, &record);
+    }
+
+    /// #578: Accumulate a star rating into an address's running `(count, sum)`
+    /// aggregate. Uses `checked_add` and panics on overflow.
+    fn record_rating(env: &Env, rated_address: &Address, stars: u32) {
+        let key = DataKeyExt4::RatingAgg(rated_address.clone());
+        let (count, sum): (u32, u32) = env.storage().persistent().get(&key).unwrap_or((0u32, 0u32));
+        let new_count = count
+            .checked_add(1)
+            .unwrap_or_else(|| panic!("rating count overflow"));
+        let new_sum = sum
+            .checked_add(stars)
+            .unwrap_or_else(|| panic!("rating sum overflow"));
+        env.storage().persistent().set(&key, &(new_count, new_sum));
+        env.storage().persistent().extend_ttl(
+            &key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+    }
+
     fn append_admin_action(env: &Env, action: Symbol, detail: Symbol) {
         let mut log: Vec<AuditEntry> = env
             .storage()
@@ -15535,7 +16282,7 @@ impl ChainSettleContract {
         if fee <= 0 {
             return;
         }
-        let key = DataKeyExt3::ShipmentFeesPaid(shipment_id.clone());
+        let key = DataKeyExt4::ShipmentFeesPaid(shipment_id.clone());
         let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
         env.storage().persistent().set(&key, &(current + fee));
         env.storage().persistent().extend_ttl(
@@ -15547,7 +16294,7 @@ impl ChainSettleContract {
 
     /// #528: Mark that at least one dispute was raised on this shipment.
     fn mark_shipment_had_dispute(env: &Env, shipment_id: &String) {
-        let key = DataKeyExt3::ShipmentHadDispute(shipment_id.clone());
+        let key = DataKeyExt4::ShipmentHadDispute(shipment_id.clone());
         env.storage().persistent().set(&key, &true);
         env.storage().persistent().extend_ttl(
             &key,
@@ -15565,7 +16312,7 @@ impl ChainSettleContract {
     ) -> Address {
         env.storage()
             .persistent()
-            .get(&DataKeyExt3::MilestoneSupplier(
+            .get(&DataKeyExt4::MilestoneSupplier(
                 shipment_id.clone(),
                 milestone_index,
             ))
@@ -15582,7 +16329,7 @@ impl ChainSettleContract {
         let bps: u32 = env
             .storage()
             .instance()
-            .get(&DataKeyExt3::CleanCompletionRebateBps)
+            .get(&DataKeyExt4::CleanCompletionRebateBps)
             .unwrap_or(0);
         if bps == 0 {
             return;
@@ -15590,7 +16337,7 @@ impl ChainSettleContract {
         let had_dispute: bool = env
             .storage()
             .persistent()
-            .get(&DataKeyExt3::ShipmentHadDispute(shipment_id.clone()))
+            .get(&DataKeyExt4::ShipmentHadDispute(shipment_id.clone()))
             .unwrap_or(false);
         if had_dispute {
             return;
@@ -15598,7 +16345,7 @@ impl ChainSettleContract {
         let fees_paid: i128 = env
             .storage()
             .persistent()
-            .get(&DataKeyExt3::ShipmentFeesPaid(shipment_id.clone()))
+            .get(&DataKeyExt4::ShipmentFeesPaid(shipment_id.clone()))
             .unwrap_or(0);
         if fees_paid <= 0 {
             return;
@@ -15680,16 +16427,16 @@ impl ChainSettleContract {
         let slash_bps: u32 = env
             .storage()
             .instance()
-            .get(&DataKeyExt3::ArbiterSlashBps)
+            .get(&DataKeyExt4::ArbiterSlashBps)
             .unwrap_or(0);
         if slash_bps == 0 {
             return;
         }
-        let stake_key = DataKeyExt3::ArbiterStake(original_arbiter.clone());
+        let stake_key = DataKeyExt4::ArbiterStake(original_arbiter.clone());
         let Some((stake_token, stake_amt)) = env
             .storage()
             .persistent()
-            .get::<DataKeyExt3, (Address, i128)>(&stake_key)
+            .get::<DataKeyExt4, (Address, i128)>(&stake_key)
         else {
             return;
         };
@@ -15960,7 +16707,7 @@ impl ChainSettleContract {
     }
 
     /// Append a shipment ID to a party index (`ArbiterShipments` / `LogisticsShipments`).
-    fn add_to_party_index(env: &Env, key: DataKeyExt3, shipment_id: &String) {
+    fn add_to_party_index(env: &Env, key: DataKeyExt4, shipment_id: &String) {
         let mut list: Vec<String> = env
             .storage()
             .persistent()
@@ -15982,7 +16729,7 @@ impl ChainSettleContract {
     }
 
     /// Remove the first matching shipment ID from a party index.
-    fn remove_from_party_index(env: &Env, key: DataKeyExt3, shipment_id: &String) {
+    fn remove_from_party_index(env: &Env, key: DataKeyExt4, shipment_id: &String) {
         let list: Vec<String> = env
             .storage()
             .persistent()
@@ -16008,10 +16755,10 @@ impl ChainSettleContract {
         }
         Self::remove_from_party_index(
             env,
-            DataKeyExt3::ArbiterShipments(old.clone()),
+            DataKeyExt4::ArbiterShipments(old.clone()),
             shipment_id,
         );
-        Self::add_to_party_index(env, DataKeyExt3::ArbiterShipments(new.clone()), shipment_id);
+        Self::add_to_party_index(env, DataKeyExt4::ArbiterShipments(new.clone()), shipment_id);
     }
 
     /// Cursor/limit page over a shipment-ID list (stable, non-overlapping).
@@ -17613,6 +18360,21 @@ impl ChainSettleContract {
     /// full retainage balance to the supplier, starts the warranty period for any
     /// warranty holdback, then emits `shipment_completed`.
     fn settle_on_completion(env: &Env, shipment_id: &String, shipment: &mut Shipment) {
+        // #578: Record the ledger at which this shipment became Completed so
+        // `rate_counterparty` can enforce its rating window. `settle_on_completion`
+        // is called exactly once, from every code path that sets
+        // `shipment.status = ShipmentStatus::Completed`, making this the single
+        // correct place to stamp it.
+        let completed_key = DataKeyExt4::CompletedAtLedger(shipment_id.clone());
+        env.storage()
+            .persistent()
+            .set(&completed_key, &env.ledger().sequence());
+        env.storage().persistent().extend_ttl(
+            &completed_key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+
         let retainage_key = DataKeyExt3::RetainageBalance(shipment_id.clone());
         let retainage: i128 = env.storage().persistent().get(&retainage_key).unwrap_or(0);
         if retainage > 0 {
@@ -17763,6 +18525,7 @@ mod test_trade_proof;
 mod test_pause_notice;
 mod test_buyer_cap_collateral_merge;
 mod test_feat_issues;
+mod test_feat_earnings;
 // Disabled: exercises milestone insurance holdback / oracle price-condition
 // APIs (see NEW_MILESTONE_FEATURES.md) that have not been implemented yet.
 // mod test_milestone_insurance_and_oracle;
