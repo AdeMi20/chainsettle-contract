@@ -140,6 +140,10 @@ fn default_options(_env: &Env) -> ShipmentOptions {
         retainage_bps: 0,
         warranty_bps: 0,
         warranty_ledgers: 0,
+        inspector: None,
+        inspected_milestones: vec![_env],
+        proof_submitters: vec![_env],
+        require_dual_attestation: false,
     }
 }
 
@@ -1328,6 +1332,10 @@ fn test_dispute_cooldown_enforced() {
             retainage_bps: 0,
             warranty_bps: 0,
             warranty_ledgers: 0,
+            inspector: None,
+            inspected_milestones: vec![&t.env],
+            proof_submitters: vec![&t.env],
+            require_dual_attestation: false,
         },
     );
 
@@ -1418,6 +1426,10 @@ fn test_dispute_cooldown_blocks_early_redispute() {
             retainage_bps: 0,
             warranty_bps: 0,
             warranty_ledgers: 0,
+            inspector: None,
+            inspected_milestones: vec![&t.env],
+            proof_submitters: vec![&t.env],
+            require_dual_attestation: false,
         },
     );
 
@@ -1538,6 +1550,10 @@ fn test_cooldown_updated_on_resolve() {
             retainage_bps: 0,
             warranty_bps: 0,
             warranty_ledgers: 0,
+            inspector: None,
+            inspected_milestones: vec![&t.env],
+            proof_submitters: vec![&t.env],
+            require_dual_attestation: false,
         },
     );
 
@@ -1950,6 +1966,10 @@ fn test_non_whitelisted_token_rejected() {
             retainage_bps: 0,
             warranty_bps: 0,
             warranty_ledgers: 0,
+            inspector: None,
+            inspected_milestones: vec![&t.env],
+            proof_submitters: vec![&t.env],
+            require_dual_attestation: false,
         },
     );
 }
@@ -2097,6 +2117,10 @@ fn test_holdback_happy_path() {
             retainage_bps: 0,
             warranty_bps: 0,
             warranty_ledgers: 0,
+            inspector: None,
+            inspected_milestones: vec![&t.env],
+            proof_submitters: vec![&t.env],
+            require_dual_attestation: false,
         },
     );
 
@@ -2209,6 +2233,10 @@ fn test_holdback_early_dispute_cancels_hold() {
             retainage_bps: 0,
             warranty_bps: 0,
             warranty_ledgers: 0,
+            inspector: None,
+            inspected_milestones: vec![&t.env],
+            proof_submitters: vec![&t.env],
+            require_dual_attestation: false,
         },
     );
 
@@ -2291,6 +2319,10 @@ fn test_holdback_early_release_rejected() {
             retainage_bps: 0,
             warranty_bps: 0,
             warranty_ledgers: 0,
+            inspector: None,
+            inspected_milestones: vec![&t.env],
+            proof_submitters: vec![&t.env],
+            require_dual_attestation: false,
         },
     );
 
@@ -2518,6 +2550,10 @@ fn test_multisig_both_buyers_must_confirm() {
             retainage_bps: 0,
             warranty_bps: 0,
             warranty_ledgers: 0,
+            inspector: None,
+            inspected_milestones: vec![&t.env],
+            proof_submitters: vec![&t.env],
+            require_dual_attestation: false,
         },
     );
 
@@ -2619,6 +2655,10 @@ fn test_multisig_minority_veto_dispute() {
             retainage_bps: 0,
             warranty_bps: 0,
             warranty_ledgers: 0,
+            inspector: None,
+            inspected_milestones: vec![&t.env],
+            proof_submitters: vec![&t.env],
+            require_dual_attestation: false,
         },
     );
 
@@ -3029,6 +3069,10 @@ fn test_deadline_cancellation_success() {
             retainage_bps: 0,
             warranty_bps: 0,
             warranty_ledgers: 0,
+            inspector: None,
+            inspected_milestones: vec![&t.env],
+            proof_submitters: vec![&t.env],
+            require_dual_attestation: false,
         },
     );
 
@@ -3109,6 +3153,10 @@ fn test_deadline_cancellation_too_early() {
             retainage_bps: 0,
             warranty_bps: 0,
             warranty_ledgers: 0,
+            inspector: None,
+            inspected_milestones: vec![&t.env],
+            proof_submitters: vec![&t.env],
+            require_dual_attestation: false,
         },
     );
 

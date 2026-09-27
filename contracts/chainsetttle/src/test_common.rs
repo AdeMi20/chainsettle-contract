@@ -139,6 +139,10 @@ pub fn default_options(_env: &Env) -> ShipmentOptions {
         retainage_bps: 0,
         warranty_bps: 0,
         warranty_ledgers: 0,
+        inspector: None,
+        inspected_milestones: vec![_env],
+        proof_submitters: vec![_env],
+        require_dual_attestation: false,
     }
 }
 

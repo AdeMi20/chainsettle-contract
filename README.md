@@ -2311,3 +2311,45 @@ Function | Who | Behaviour
 `get_warranty_balance` / `get_warranty_end_ledger` / `get_warranty_claim` | Anyone (read-only) | Holdback in escrow, the ledger the period ends (`0` = not started), and the open claim.
 
 Events: `warranty_started`, `warranty_claim_filed`, `warranty_claim_resolved`, `warranty_released`. Each has a matching audit-log entry. A shipment cannot be archived while a warranty holdback is still in escrow. Cancelling before completion refunds any withheld warranty to the buyer.
+
+### Trade Compliance & Proof Controls (#543–#546)
+
+Four optional `ShipmentOptions` fields for inspection, designated proof submitters, dual attestation, and oracle condition-breach disputes. Defaults leave existing behaviour unchanged. Values are validated in `create_shipment` and stored under `DataKeyExt3` keys.
+
+| Option | Type | Validation / default |
+| --- | --- | --- |
+| `inspector` | `Option<Address>` | `None` = no inspector |
+| `inspected_milestones` | `Vec<u32>` | Empty = none. Requires `inspector`. Indices must be in range |
+| `proof_submitters` | `Vec<Address>` | Empty = supplier-only. Non-empty length must match milestones |
+| `require_dual_attestation` | `bool` | `false` = unchanged single-submitter flow |
+
+#### Independent inspector sign-off (#543)
+
+Function | Who | Behaviour
+--- | --- | ---
+`inspector_sign_off(inspector, shipment_id, milestone_index, report_hash)` | Named `inspector` | Stores the report hash for an inspected milestone. Emits `inspector_signed_off` and writes an audit entry.
+`get_inspection(shipment_id, milestone_index)` | Anyone (read-only) | Returns the stored `InspectionRecord`, if any.
+`confirm_milestone` / graded / partial confirm | Buyer | Panics with `inspector sign-off required` for inspected milestones until sign-off exists. Other milestones are unaffected.
+
+#### Per-milestone designated proof submitter (#544)
+
+Function | Who | Behaviour
+--- | --- | ---
+`submit_proof` / `correct_proof` | Designated address | Empty `proof_submitters` → only the supplier. Otherwise only the address at that milestone index.
+`get_proof_submitter(shipment_id, milestone_index)` | Anyone (read-only) | Returns the designated (or default supplier) address.
+
+#### Dual attestation (#545)
+
+When `require_dual_attestation` is true, the first `submit_proof` from the designated submitter (supplier or logistics) stores a pending proof and leaves the milestone `Pending`. The other of supplier/logistics calls `attest_proof(caller, shipment_id, milestone_index, proof_hash)` with a matching hash; only then does the milestone move to `ProofSubmitted` and the review window start. Mismatched hashes are rejected. When disabled, behaviour is unchanged.
+
+Events: `dual_proof_pending`, `proof_attested`, then the usual `proof_submitted`.
+
+#### Oracle condition-breach auto-dispute (#546)
+
+Requires a shipment oracle purpose (`set_shipment_oracle_purpose`) and a registered N-of-M group (`register_oracle_group`). Works alongside existing oracle attestations used for confirmation gating.
+
+Function | Who | Behaviour
+--- | --- | ---
+`report_condition_breach(oracle, shipment_id, milestone_index, data_hash)` | Group member | Records the report, emits `condition_breach_reported`, appends an audit entry. Duplicate reports from the same oracle are ignored. When distinct reports reach the group threshold, a dispute opens automatically on the milestone.
+
+Non-group callers are rejected. Threshold gating ensures a dispute opens only after enough distinct reports.
