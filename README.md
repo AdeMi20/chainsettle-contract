@@ -2312,57 +2312,44 @@ Function | Who | Behaviour
 
 Events: `warranty_started`, `warranty_claim_filed`, `warranty_claim_resolved`, `warranty_released`. Each has a matching audit-log entry. A shipment cannot be archived while a warranty holdback is still in escrow. Cancelling before completion refunds any withheld warranty to the buyer.
 
----
+### Trade Compliance & Proof Controls (#543–#546)
 
-## Clean-completion fee rebate (#528)
+Four optional `ShipmentOptions` fields for inspection, designated proof submitters, dual attestation, and oracle condition-breach disputes. Defaults leave existing behaviour unchanged. Values are validated in `create_shipment` and stored under `DataKeyExt3` keys.
 
-Refunds a configurable share of the platform fees paid on a shipment when it completes with **zero disputes ever raised**.
+| Option | Type | Validation / default |
+| --- | --- | --- |
+| `inspector` | `Option<Address>` | `None` = no inspector |
+| `inspected_milestones` | `Vec<u32>` | Empty = none. Requires `inspector`. Indices must be in range |
+| `proof_submitters` | `Vec<Address>` | Empty = supplier-only. Non-empty length must match milestones |
+| `require_dual_attestation` | `bool` | `false` = unchanged single-submitter flow |
 
-| Function | Who | Behaviour |
-|---|---|---|
-| `set_clean_completion_rebate_bps(admin, bps)` | Admin | Sets the rebate share in basis points (`0` disables, max `10_000`). Emits `clean_completion_rebate_bps_set`. |
-| `get_clean_completion_rebate_bps() → u32` | Anyone | Current rebate bps. |
-| `get_shipment_fees_paid(shipment_id) → i128` | Anyone | Cumulative platform fees collected for that shipment. |
+#### Independent inspector sign-off (#543)
 
-On shipment completion (`settle_on_completion`), if rebate bps > 0, no dispute was ever raised, and fees were collected, the contract pays `min(fees_paid × bps / 10_000, fees_paid)` from the fee treasury to the supplier. The rebate is **skipped gracefully** when tracked treasury revenue or the treasury token balance is insufficient. Emits `clean_completion_rebate` and writes a shipment audit entry.
+Function | Who | Behaviour
+--- | --- | ---
+`inspector_sign_off(inspector, shipment_id, milestone_index, report_hash)` | Named `inspector` | Stores the report hash for an inspected milestone. Emits `inspector_signed_off` and writes an audit entry.
+`get_inspection(shipment_id, milestone_index)` | Anyone (read-only) | Returns the stored `InspectionRecord`, if any.
+`confirm_milestone` / graded / partial confirm | Buyer | Panics with `inspector sign-off required` for inspected milestones until sign-off exists. Other milestones are unaffected.
 
----
+#### Per-milestone designated proof submitter (#544)
 
-## Arbiter stake slashing on overturn (#531)
+Function | Who | Behaviour
+--- | --- | ---
+`submit_proof` / `correct_proof` | Designated address | Empty `proof_submitters` → only the supplier. Otherwise only the address at that milestone index.
+`get_proof_submitter(shipment_id, milestone_index)` | Anyone (read-only) | Returns the designated (or default supplier) address.
 
-When an appeal **overturns** an arbiter's resolution, a configurable share of that arbiter's locked stake is transferred to the party the appeal ruled for. This is independent of the existing reputation/pool slash (`set_max_overturned_before_slash`).
+#### Dual attestation (#545)
 
-| Function | Who | Behaviour |
-|---|---|---|
-| `set_arbiter_slash_bps(admin, bps)` | Admin | Stake-slash share in bps (`0` disables, max `10_000`). Emits `arbiter_slash_bps_set`. |
-| `get_arbiter_slash_bps() → u32` | Anyone | Current slash bps. |
-| `deposit_arbiter_stake(arbiter, token, amount)` | Arbiter | Locks stake in the contract. Emits `arbiter_stake_deposited`. |
-| `get_arbiter_stake(arbiter) → i128` | Anyone | Locked stake amount. |
+When `require_dual_attestation` is true, the first `submit_proof` from the designated submitter (supplier or logistics) stores a pending proof and leaves the milestone `Pending`. The other of supplier/logistics calls `attest_proof(caller, shipment_id, milestone_index, proof_hash)` with a matching hash; only then does the milestone move to `ProofSubmitted` and the review window start. Mismatched hashes are rejected. When disabled, behaviour is unchanged.
 
-On overturn only (not when the appeal upholds the original outcome): `slash = min(stake × bps / 10_000, stake)` moves from the contract to the wronged party (supplier if appeal `approve=true`, primary buyer if `approve=false`). Emits `arbiter_stake_slashed`. The slashed amount never exceeds remaining stake.
+Events: `dual_proof_pending`, `proof_attested`, then the usual `proof_submitted`.
 
----
+#### Oracle condition-breach auto-dispute (#546)
 
-## Substitute supplier for a defaulted milestone (#552)
+Requires a shipment oracle purpose (`set_shipment_oracle_purpose`) and a registered N-of-M group (`register_oracle_group`). Works alongside existing oracle attestations used for confirmation gating.
 
-Lets the buyer, with arbiter approval, reassign an **overdue Pending** milestone to a substitute supplier. The original supplier keeps payments for milestones they already completed.
+Function | Who | Behaviour
+--- | --- | ---
+`report_condition_breach(oracle, shipment_id, milestone_index, data_hash)` | Group member | Records the report, emits `condition_breach_reported`, appends an audit entry. Duplicate reports from the same oracle are ignored. When distinct reports reach the group threshold, a dispute opens automatically on the milestone.
 
-| Function | Who | Behaviour |
-|---|---|---|
-| `propose_substitute_supplier(buyer, shipment_id, milestone_index, new_supplier)` | Buyer | Only for overdue (`ledger > deadline_ledger`) Pending milestones. Emits `substitute_proposed` and audit entry. |
-| `approve_substitute_supplier(arbiter, shipment_id, milestone_index)` | Shipment arbiter | Applies the pending proposal. Emits `substitute_approved` / `supplier_substituted` and audit entry. |
-| `get_milestone_supplier(shipment_id, milestone_index) → Option<Address>` | Anyone | Approved substitute, if any. |
-
-After approval, proof submission and payout for that milestone go to the substitute (logistics may still submit proof). Other milestones are unchanged.
-
----
-
-## Batch cancel shipments (#580)
-
-Lets a buyer cancel several of their shipments in one transaction.
-
-| Function | Who | Behaviour |
-|---|---|---|
-| `batch_cancel_shipments(buyer, shipment_ids, reason)` | Buyer | Cancels each ID with the same rules and fees as `cancel_shipment`. |
-
-**Atomicity:** the whole batch fails if any single shipment cannot be cancelled (invalid ID, not active, open dispute, not the buyer, etc.). Batch size is capped at `MAX_BATCH_CANCEL_SHIPMENTS` (20). Each cancelled shipment emits the usual `shipment_cancelled` event; `reason` is also emitted as `batch_cancel_reason` per shipment and recorded in the audit log.
+Non-group callers are rejected. Threshold gating ensures a dispute opens only after enough distinct reports.
