@@ -444,6 +444,18 @@ shipment's `total_amount`, and leaves the milestone percentages unchanged.
 That means every milestone keeps the same percentage split, but each
 milestone's absolute payout becomes larger because the escrow base grew.
 
+`propose_milestone_split(caller, shipment_id, milestone_index, parts)` and
+`approve_milestone_split(counterparty, shipment_id, milestone_index)`
+let the buyer and supplier jointly replace one pending milestone with two or
+more named parts. Each part contains a `name` and `payment_percent`; the part
+percentages must sum to the original milestone percentage, and the resulting
+milestone count must remain within the configured maximum. Only a pending
+milestone with no proof, advance, dispute, or quantity progress is eligible.
+The proposal does not alter the shipment. The split is applied only after the
+other party approves it; the original deadline and penalty settings are copied
+to each part, later milestones and their indexed state shift forward, and
+escrow plus the total payout weights remain unchanged.
+
 ---
 
 Partial Disputes & Escalation Checks
@@ -2385,6 +2397,56 @@ Function | Who | Behaviour
 
 Events: `warranty_started`, `warranty_claim_filed`, `warranty_claim_resolved`, `warranty_released`. Each has a matching audit-log entry. A shipment cannot be archived while a warranty holdback is still in escrow. Cancelling before completion refunds any withheld warranty to the buyer.
 
+### Tier-based Maximum Shipment Value (#560)
+
+Cap a single shipment's `total_amount` according to the supplier's current reputation tier (Bronze / Silver / Gold). This stacks with the existing global and per-token max shipment value checks.
+
+`SupplierTierConfig` gains three fields (each `0` = unlimited):
+
+| Field | Meaning |
+| --- | --- |
+| `bronze_max_value` | Max shipment value for Bronze suppliers |
+| `silver_max_value` | Max shipment value for Silver suppliers |
+| `gold_max_value` | Max shipment value for Gold suppliers |
+
+When `create_shipment` runs and a tier config is set, the contract derives the supplier's tier and rejects amounts above that tier's cap with `SupplierTierMaxValueExceeded: {Tier} cap={n}`. Upgrading a supplier's tier (via completed shipments) automatically raises the allowed value.
+
+### Buyer Escrow Vault (#561)
+
+Frequent buyers can pre-fund a contract-held vault and create shipments that draw from it.
+
+| Function | Who | Behaviour |
+| --- | --- | --- |
+| `vault_deposit(buyer, token, amount)` | Buyer | Transfers tokens into the vault. Emits `vault_deposited`. |
+| `vault_withdraw(buyer, token, amount)` | Buyer | Withdraws up to the vault balance. Emits `vault_withdrawn`. |
+| `get_vault_balance(buyer, token)` | Anyone | Read-only balance. |
+
+Set `ShipmentOptions.fund_from_vault = true` to debit the primary buyer's vault (including dispute bonds and early-bonus pool) instead of a wallet transfer. Insufficient vault funds panic with `insufficient vault balance`. Refunds on vault-funded shipments (e.g. `cancel_shipment`) are credited back to the vault. `withdraw_treasury_dust` excludes vault balances via `TotalVaulted`.
+
+### Standing Orders (#562)
+
+Register a vault-funded recurring template that anyone can trigger when due.
+
+| Function | Who | Behaviour |
+| --- | --- | --- |
+| `create_standing_order(buyer, params)` | Buyer | Saves the template (`StandingOrderParams`: template name, parties, token, amount, milestones, `interval_ledgers`, `max_occurrences`). Returns `order_id`. |
+| `execute_standing_order(order_id)` | Anyone | When `ledger >= next_ledger` and occurrences remain, creates a vault-funded shipment with deterministic id `so-{order_id}-{occurrence}`, then advances the schedule. |
+| `cancel_standing_order(buyer, order_id)` | Owner | Marks the order cancelled. |
+| `get_standing_order(order_id)` | Anyone | Read-only. |
+
+Execution fails cleanly when the vault balance is insufficient, the order is not due, cancelled, or exhausted.
+
+### Fund Escrow via Token Allowance (#563)
+
+`create_shipment_with_allowance(params: AllowanceShipmentParams)` lets a spender create a shipment on a buyer's behalf using SAC `approve` + `transfer_from`.
+
+- `spender` must `require_auth`
+- `from` must be one of the `buyers`
+- Funding uses `token.transfer_from(spender, from, contract, amount)` (including bonds / early bonus)
+- Otherwise identical to `create_shipment` (same shipment shape and wallet refunds)
+
+Tests cover the SAC approve flow, insufficient allowance, and the `from`-must-be-buyer guard.
+
 ### Trade Compliance & Proof Controls (#543–#546)
 
 Four optional `ShipmentOptions` fields for inspection, designated proof submitters, dual attestation, and oracle condition-breach disputes. Defaults leave existing behaviour unchanged. Values are validated in `create_shipment` and stored under `DataKeyExt3` keys.
@@ -2426,3 +2488,48 @@ Function | Who | Behaviour
 `report_condition_breach(oracle, shipment_id, milestone_index, data_hash)` | Group member | Records the report, emits `condition_breach_reported`, appends an audit entry. Duplicate reports from the same oracle are ignored. When distinct reports reach the group threshold, a dispute opens automatically on the milestone.
 
 Non-group callers are rejected. Threshold gating ensures a dispute opens only after enough distinct reports.
+
+### Shipment Summaries, Volume Counters, Dispute History & Ratings (#575–#578)
+
+Lightweight list views, cumulative volume analytics, full dispute history, and post-completion mutual ratings. New persistent keys live under `DataKeyExt4` (Ext3 was at capacity).
+
+#### Lightweight shipment summary (#575)
+
+Function | Who | Behaviour
+--- | --- | ---
+`get_shipment_summary(shipment_id)` | Anyone (read-only) | Returns `ShipmentSummary` (`id`, `status`, `buyers`, `supplier`, `token`, `total_amount`, `released_amount`, `milestone_count`, `open_disputes`, `created_at`) without `audit_log` or `milestones`. Panics if the ID is unknown.
+`get_shipment_summaries(ids)` | Anyone (read-only) | Batch variant. Unknown IDs are skipped. Panics if `ids.len()` exceeds the admin max.
+`set_max_summary_batch(admin, max)` / `get_max_summary_batch()` | Admin / anyone | Cap for the batch call (default `50`).
+
+#### Per-address earnings & spend by token (#576)
+
+On every supplier payout (confirm, held release, auto-confirm, dispute approve / finalize / timeout / mediation / panel, partial uncontested release), the contract updates:
+
+- `SupplierEarned(supplier, token)` — **net** amount paid to the supplier after platform / logistics / referral / arbiter fees
+- `BuyerSpent(buyer, token)` — **gross** amount released from escrow toward settlement (before fees)
+
+Refunds to the buyer never increment either counter. Both use checked arithmetic and panic on overflow.
+
+Function | Who | Behaviour
+--- | --- | ---
+`get_supplier_earnings(supplier, token)` | Anyone (read-only) | Cumulative net earnings for that token.
+`get_buyer_spend(buyer, token)` | Anyone (read-only) | Cumulative gross spend for that token.
+
+#### Paginated dispute history (#577)
+
+When a dispute terminates, a `DisputeRecord { shipment_id, milestone_index, opened_ledger, outcome }` is appended to **both** the primary buyer's and the supplier's histories (`DisputeOutcome`: `Buyer`, `Supplier`, or `Withdrawn`). Withdrawn disputes record `Withdrawn`. Outcomes reflect the final result after any appeal. Histories are append-only (ring-capped at 100) so pagination by index is stable while an entry remains.
+
+Function | Who | Behaviour
+--- | --- | ---
+`get_dispute_history(address, cursor, limit)` | Anyone (read-only) | Page of `DisputeRecord`s. `cursor` is a 0-based start index (`None` = 0); `limit` is clamped to 50.
+
+#### Mutual shipment ratings (#578)
+
+After a shipment reaches `Completed`, each party may rate the other once within an admin-configured ledger window (`0` = ratings disabled). Buyer rates the supplier; supplier rates the primary buyer. Stars must be `1..=5`. Averages use integer math: `average_x100 = (sum * 100) / count`.
+
+Function | Who | Behaviour
+--- | --- | ---
+`set_rating_window_ledgers(admin, window)` / `get_rating_window_ledgers()` | Admin / anyone | Ledgers after completion during which ratings are accepted.
+`rate_counterparty(caller, shipment_id, stars, comment_hash)` | Buyer or supplier | One rating per party per shipment. Emits `counterparty_rated` and writes an audit entry.
+`get_rating_summary(address)` | Anyone (read-only) | `(count, average_x100)`. `(0, 0)` if never rated.
+

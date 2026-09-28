@@ -64,6 +64,9 @@ fn standard_tier_config(_env: &Env) -> SupplierTierConfig {
         gold_min_completed: 5,
         gold_max_disputed_ratio_bps: 10_000,
         gold_multiplier_bps: 5_000,
+        bronze_max_value: 0,
+        silver_max_value: 0,
+        gold_max_value: 0,
     }
 }
 

@@ -144,6 +144,7 @@ fn default_options(_env: &Env) -> ShipmentOptions {
         inspected_milestones: vec![_env],
         proof_submitters: vec![_env],
         require_dual_attestation: false,
+        fund_from_vault: false,
     }
 }
 
@@ -1336,6 +1337,7 @@ fn test_dispute_cooldown_enforced() {
             inspected_milestones: vec![&t.env],
             proof_submitters: vec![&t.env],
             require_dual_attestation: false,
+            fund_from_vault: false,
         },
     );
 
@@ -1430,6 +1432,7 @@ fn test_dispute_cooldown_blocks_early_redispute() {
             inspected_milestones: vec![&t.env],
             proof_submitters: vec![&t.env],
             require_dual_attestation: false,
+            fund_from_vault: false,
         },
     );
 
@@ -1554,6 +1557,7 @@ fn test_cooldown_updated_on_resolve() {
             inspected_milestones: vec![&t.env],
             proof_submitters: vec![&t.env],
             require_dual_attestation: false,
+            fund_from_vault: false,
         },
     );
 
@@ -1970,6 +1974,7 @@ fn test_non_whitelisted_token_rejected() {
             inspected_milestones: vec![&t.env],
             proof_submitters: vec![&t.env],
             require_dual_attestation: false,
+            fund_from_vault: false,
         },
     );
 }
@@ -2121,6 +2126,7 @@ fn test_holdback_happy_path() {
             inspected_milestones: vec![&t.env],
             proof_submitters: vec![&t.env],
             require_dual_attestation: false,
+            fund_from_vault: false,
         },
     );
 
@@ -2237,6 +2243,7 @@ fn test_holdback_early_dispute_cancels_hold() {
             inspected_milestones: vec![&t.env],
             proof_submitters: vec![&t.env],
             require_dual_attestation: false,
+            fund_from_vault: false,
         },
     );
 
@@ -2323,6 +2330,7 @@ fn test_holdback_early_release_rejected() {
             inspected_milestones: vec![&t.env],
             proof_submitters: vec![&t.env],
             require_dual_attestation: false,
+            fund_from_vault: false,
         },
     );
 
@@ -2554,6 +2562,7 @@ fn test_multisig_both_buyers_must_confirm() {
             inspected_milestones: vec![&t.env],
             proof_submitters: vec![&t.env],
             require_dual_attestation: false,
+            fund_from_vault: false,
         },
     );
 
@@ -2659,6 +2668,7 @@ fn test_multisig_minority_veto_dispute() {
             inspected_milestones: vec![&t.env],
             proof_submitters: vec![&t.env],
             require_dual_attestation: false,
+            fund_from_vault: false,
         },
     );
 
@@ -3073,6 +3083,7 @@ fn test_deadline_cancellation_success() {
             inspected_milestones: vec![&t.env],
             proof_submitters: vec![&t.env],
             require_dual_attestation: false,
+            fund_from_vault: false,
         },
     );
 
@@ -3157,6 +3168,7 @@ fn test_deadline_cancellation_too_early() {
             inspected_milestones: vec![&t.env],
             proof_submitters: vec![&t.env],
             require_dual_attestation: false,
+            fund_from_vault: false,
         },
     );
 
