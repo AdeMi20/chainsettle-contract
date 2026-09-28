@@ -256,6 +256,39 @@ Function Who Effect
 `remove_allowed_token(token)` Admin only Revokes approval; existing shipments that already use the token are unaffected
 `get_allowed_tokens() → Vec<Address>` Anyone (read-only) Returns the current allowlist (empty = open mode)
 The allowlist gates shipment creation only. After a shipment is created, all payouts (`confirm_milestone`, dispute resolution, cancellation refunds, etc.) always use the token address stored on that shipment — they never re-check the allowlist.
+
+### Allowed-Token List Cap and Buyer Token Allowlist (#387, #388)
+
+Two complementary features let admins further tighten which tokens buyers can use.
+
+**Allowed-token list cap** — an admin can set an upper bound on how many entries the global allowlist may grow to. This guards against accidental unbounded growth when tokens are added programmatically.
+
+| Function | Who | Behaviour |
+| --- | --- | --- |
+| `set_max_allowed_tokens(admin, max_allowed)` | Admin | Stores `max_allowed` (a `u32`) in instance storage and emits `max_allowed_tokens_set`. Pass `0` to remove the cap (no limit, the default). |
+| `get_max_allowed_tokens() → u32` | Anyone (read-only) | Returns the current cap, or `0` when no cap is set. |
+
+Important: **lowering the cap does not invalidate the existing list**. The cap is only enforced at the point where `add_allowed_token` is called. If the list already has more entries than a newly lowered cap, existing entries remain valid.
+
+**Buyer-specific token allowlist** — an admin can restrict an individual buyer to a subset of the global allowlist. When a buyer-specific list is set, `create_shipment` rejects any token that is not in that list, even if the token is in the global allowlist.
+
+| Function | Who | Behaviour |
+| --- | --- | --- |
+| `set_buyer_allowed_tokens(admin, buyer, tokens)` | Admin | Stores the buyer's permitted token list in persistent storage and emits `buyer_allowed_tokens_set`. Every address in `tokens` must already be in the global allowlist (if the global list is non-empty) — a non-listed token panics with `"token is not in the approved whitelist"`. Pass an empty `Vec` to clear the restriction. |
+| `get_buyer_allowed_tokens(buyer) → Vec<Address>` | Anyone (read-only) | Returns the buyer's restricted list, or an empty list when no override is set. |
+
+**Fallback rule:** an empty buyer list means _no restriction beyond the global allowlist_ — the buyer may use any globally-allowed token. A non-empty buyer list is a strict subset: the buyer may only use tokens that appear in both the global list and their own list.
+
+Example — restrict buyer `GBUYER…` to USDC only:
+
+```bash
+stellar contract invoke --id $CONTRACT_ID -- \
+  set_buyer_allowed_tokens \
+  --admin $ADMIN_ADDRESS \
+  --buyer GBUYER_ADDRESS \
+  --tokens '["USDC_SAC_ADDRESS"]'
+```
+
 `submit_proof(caller, shipment_id, milestone_index, proof_hash, proof_type)`
 Supplier or logistics submits proof for a milestone (`proof_hash` is the payload reference, e.g. an IPFS CID; `proof_type` is a short symbol naming the content scheme, e.g. `ipfs`, `sha256`, or `url`).
 Milestone must be in `Pending` status. Moves status to `ProofSubmitted`.
@@ -2324,6 +2357,46 @@ The contract allows updating the active buyer or supplier on a shipment using `t
   - `BuyerTransferred(shipment_id, old_buyer, new_buyer)`
   - `SupplierTransferred(shipment_id, old_supplier, new_supplier)`
 
+### Shipment Custom Metadata Key-Value Store (#394)
+
+Buyers and suppliers can attach small, structured key/value pairs to a shipment — such as a PO number, cost centre, or internal reference code — beyond the single IPFS `metadata_hash` captured at creation time.
+
+**Who may write:** the shipment's buyer or supplier (either may set or overwrite any key). Admins, logistics providers, and strangers are not permitted.
+
+**Key/value constraints:** keys are Soroban `Symbol` values (up to 32 alphanumeric/underscore characters, case-sensitive). Values are plain `String`s. There is no hard limit on the number of distinct keys per shipment, but each key/value pair consumes persistent storage that is subject to the contract's TTL policy (`TTL_INITIAL_LEDGERS` / `TTL_MAX_LEDGERS`). The TTL is refreshed on every write.
+
+**Difference from `metadata_hash`:** the IPFS `metadata_hash` is set once at creation and is immutable. The custom metadata store allows arbitrary key/value pairs that either party can add or update at any time while the shipment is active.
+
+| Function | Who | Behaviour |
+| --- | --- | --- |
+| `set_shipment_metadata(caller, shipment_id, key, value)` | Buyer or Supplier | Stores (or overwrites) `value` under `key` for the shipment. Emits `shipment_metadata_set` with `(caller, key, value)`. If `key` is new, it is also appended to an internal keys index. |
+| `get_shipment_metadata(shipment_id, key) → Option<String>` | Anyone (read-only) | Returns the value for `key`, or `None` if that key was never set. |
+| `get_shipment_metadata_keys(shipment_id) → Vec<Symbol>` | Anyone (read-only) | Returns all keys that have ever been set on the shipment (keys are never removed from the index, even if a value is overwritten). |
+
+Example — buyer attaches a PO number and a cost centre:
+
+```bash
+stellar contract invoke --id $CONTRACT_ID -- \
+  set_shipment_metadata \
+  --caller $BUYER_ADDRESS \
+  --shipment_id "SHP-001" \
+  --key po_number \
+  --value "PO-2024-7890"
+
+stellar contract invoke --id $CONTRACT_ID -- \
+  set_shipment_metadata \
+  --caller $BUYER_ADDRESS \
+  --shipment_id "SHP-001" \
+  --key cost_centre \
+  --value "CC-APAC-42"
+
+# Read back all keys
+stellar contract invoke --id $CONTRACT_ID -- \
+  get_shipment_metadata_keys \
+  --shipment_id "SHP-001"
+# → ["po_number", "cost_centre"]
+```
+
 ### Settlement Options: Quality Grades, Partial Quantities, Retainage & Warranty
 
 Four optional `ShipmentOptions` fields change how milestone money is settled. Each defaults to off (empty `Vec` or `0`), so existing shipments behave exactly as before. The values are validated in `create_shipment` and stored under their own storage keys.
@@ -2378,6 +2451,46 @@ Function | Who | Behaviour
 `get_warranty_balance` / `get_warranty_end_ledger` / `get_warranty_claim` | Anyone (read-only) | Holdback in escrow, the ledger the period ends (`0` = not started), and the open claim.
 
 Events: `warranty_started`, `warranty_claim_filed`, `warranty_claim_resolved`, `warranty_released`. Each has a matching audit-log entry. A shipment cannot be archived while a warranty holdback is still in escrow. Cancelling before completion refunds any withheld warranty to the buyer.
+
+### Per-Token Minimum and Maximum Shipment Value (#362)
+
+Admins can override the global `min_shipment_value` / `max_shipment_value` bounds on a per-token basis. This allows different value floors and ceilings for high-value tokens (e.g. BTC-backed assets) and low-denomination stablecoins without changing the contract-wide defaults.
+
+**Fallback order:** when `create_shipment` validates a shipment's `total_amount`, it checks for a per-token override first. If no override is set for that token (`get_*` returns `None`), the global bound applies.
+
+| Function | Who | Behaviour |
+| --- | --- | --- |
+| `set_token_min_shipment_value(admin, token, min_amount)` | Admin | Stores a per-token minimum in instance storage and emits `token_min_shipment_value_set`. `min_amount` must be ≥ 0; negative values panic with `InvalidAmount`. |
+| `get_token_min_shipment_value(token) → Option<i128>` | Anyone (read-only) | Returns the per-token minimum override, or `None` when no override is set (token falls back to the global minimum). |
+| `clear_token_min_shipment_value(admin, token)` | Admin | Removes the per-token override so the token reverts to the global minimum. Emits `token_min_shipment_value_cleared`. |
+| `set_token_max_shipment_value(admin, token, max_value)` | Admin | Stores a per-token maximum in instance storage and emits `token_max_shipment_value_set`. `max_value` must be ≥ 0. |
+| `get_token_max_shipment_value(token) → Option<i128>` | Anyone (read-only) | Returns the per-token maximum override, or `None` when no override is set (token falls back to the global maximum). |
+| `clear_token_max_shipment_value(admin, token)` | Admin | Removes the per-token override so the token reverts to the global maximum. Emits `token_max_shipment_value_cleared`. |
+
+**Comparison — global vs. per-token settings:**
+
+| Setting | Scope | Default when unset |
+| --- | --- | --- |
+| `set_min_shipment_value` / `get_min_shipment_value` | All tokens | `0` (no minimum) |
+| `set_max_shipment_value` / `get_max_shipment_value` | All tokens | `0` (no maximum) |
+| `set_token_min_shipment_value` / `get_token_min_shipment_value` | One specific token | Falls back to global minimum |
+| `set_token_max_shipment_value` / `get_token_max_shipment_value` | One specific token | Falls back to global maximum |
+
+Example — set a minimum of 1 000 000 stroops for the EURC token and no maximum:
+
+```bash
+stellar contract invoke --id $CONTRACT_ID -- \
+  set_token_min_shipment_value \
+  --admin $ADMIN_ADDRESS \
+  --token $EURC_SAC_ADDRESS \
+  --min_amount 1000000
+
+# Remove the override later to fall back to the global minimum
+stellar contract invoke --id $CONTRACT_ID -- \
+  clear_token_min_shipment_value \
+  --admin $ADMIN_ADDRESS \
+  --token $EURC_SAC_ADDRESS
+```
 
 ### Tier-based Maximum Shipment Value (#560)
 
