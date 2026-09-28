@@ -37,6 +37,9 @@ fn silver_at_one_config() -> SupplierTierConfig {
         gold_min_completed: 100,
         gold_max_disputed_ratio_bps: 0,
         gold_multiplier_bps: 5_000,
+        bronze_max_value: 0,
+        silver_max_value: 0,
+        gold_max_value: 0,
     }
 }
 

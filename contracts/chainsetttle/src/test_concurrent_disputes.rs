@@ -117,6 +117,7 @@ fn create_and_dispute(
             inspected_milestones: vec![env],
             proof_submitters: vec![env],
             require_dual_attestation: false,
+            fund_from_vault: false,
         },
     );
     let proof = String::from_str(env, "ipfs://concurrent-proof");
