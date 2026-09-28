@@ -2515,3 +2515,73 @@ Function | Who | Behaviour
 `rate_counterparty(caller, shipment_id, stars, comment_hash)` | Buyer or supplier | One rating per party per shipment. Emits `counterparty_rated` and writes an audit entry.
 `get_rating_summary(address)` | Anyone (read-only) | `(count, average_x100)`. `(0, 0)` if never rated.
 
+
+### Emergency Freeze / Unfreeze Governance (#402)
+
+The emergency freeze is a stricter kill switch than `pause()`/`unpause()`, and it is stored separately. While it is active, every call guarded by the pause check panics with `contract is under emergency freeze`. Calling `unpause()` does **not** lift it.
+
+How a freeze is activated or lifted depends on whether multisig admin governance (`initialize_multisig_admin`, #166) is configured:
+
+- **No multisig configured:** a single admin's `propose_emergency_freeze` / `propose_emergency_unfreeze` takes effect immediately and returns `0`.
+- **Multisig configured:** a registered admin opens a proposal and the proposer's approval counts as the first vote. The action executes automatically when the number of distinct approvals reaches the **supermajority** of registered admins. This bar is higher than the routine `MultiAdminConfig.threshold`. Required approvals = `ceil(admins × bps / 10000)`, with a minimum of 1. With the default 8000 bps (80%) and 5 admins, 4 approvals are needed.
+
+Function | Who | Behaviour
+--- | --- | ---
+`set_freeze_supermajority_bps(admin, bps)` | Admin | Sets the supermajority. `bps` must be in `(0, 10000]`. Emits `freeze_supermajority_bps_set`.
+`get_freeze_supermajority_bps()` | Anyone (read-only) | Configured value, default `8000`.
+`is_emergency_frozen()` | Anyone (read-only) | `true` while the freeze is active.
+`propose_emergency_freeze(admin) → u64` | Admin / multisig admin | Opens a freeze proposal and returns its id. If one approval already meets the supermajority, the freeze activates immediately. Emits `emergency_freeze_proposed`.
+`approve_emergency_freeze(admin, proposal_id)` | Multisig admin | Adds an approval. Panics on a duplicate approval or an unknown or already-executed proposal. Emits `emergency_freeze_approved` `(admin, approvals_count)`.
+`propose_emergency_unfreeze(admin) → u64` | Admin / multisig admin | Same flow as freezing, for lifting the freeze. Emits `emergency_unfreeze_proposed`.
+`approve_emergency_unfreeze(admin, proposal_id)` | Multisig admin | Same rules as `approve_emergency_freeze`. Emits `emergency_unfreeze_approved`.
+`get_emergency_freeze_proposal(id)` / `get_emergency_unfreeze_proposal(id)` | Anyone (read-only) | The pending `EmergencyFreezeProposal { approvals }`, or `None` once it has executed or if it never existed.
+
+When the threshold is met, the proposal is deleted and `emergency_freeze_activated` or `emergency_freeze_lifted` is emitted. Freeze and unfreeze proposals share one id counter, so ids are unique across both kinds.
+
+```bash
+# 5 registered multisig admins, default 80% → 4 approvals required
+stellar contract invoke --id $CONTRACT_ID --source admin1 --network testnet \
+  -- propose_emergency_freeze --admin $ADMIN1          # → 1 (1/4 approvals)
+
+stellar contract invoke --id $CONTRACT_ID --source admin2 --network testnet \
+  -- approve_emergency_freeze --admin $ADMIN2 --proposal_id 1   # 2/4
+# ... admin3 and admin4 approve → freeze activates
+
+stellar contract invoke --id $CONTRACT_ID --network testnet -- is_emergency_frozen   # → true
+```
+
+### Milestone Templates (#365)
+
+Buyers can save a named milestone set once and reuse it for new shipments. Templates are namespaced by creator address, so two creators can use the same name without colliding.
+
+Function | Who | Behaviour
+--- | --- | ---
+`save_milestone_template(creator, name, milestones)` | Creator | Validates the milestones the same way `create_shipment` does: not empty (`EmptyMilestoneTemplate`), no more than the max milestone count (`TooManyMilestones`), every `payment_percent` at least the minimum milestone percent (`InvalidPercentages`), and percentages summing to 100. Runtime state is reset: status becomes `Pending`, and the proof hash, release ledger and proof/dispute ledgers are cleared. Saving under an existing name overwrites that template. Blocked while the contract is paused or frozen. Emits `milestone_template_saved` `(creator, name)`.
+`list_milestone_templates(creator) → Vec<String>` | Anyone (read-only) | Names saved by `creator`, in the order they were first saved.
+`get_milestone_template(creator, name) → Vec<Milestone>` | Anyone (read-only) | The saved milestones. Panics with `TemplateNotFound` if none exists.
+`create_shipment_from_template(shipment_id, buyers, supplier, logistics, arbiter, token, total_amount, template_name, options)` | Primary buyer | Looks up `template_name` under `buyers[0]` and calls `create_shipment` with those milestones. All the usual `create_shipment` auth and validation still apply. Panics with `TemplateNotFound` if the primary buyer has no template with that name.
+
+Templates are copied into a shipment when it is created. Changing a template later does not affect shipments that already exist. There is currently no function to delete a template.
+
+### Supplier Tiering (#397, #478)
+
+Suppliers are ranked **Bronze**, **Silver** or **Gold** based on their reputation score (`completed` and `disputed` counts). A higher tier lowers the supplier's required collateral and, if #560 is configured, raises their maximum shipment value (see [Tier-based Maximum Shipment Value](#tier-based-maximum-shipment-value-560)).
+
+`SupplierTierConfig`:
+
+| Field | Meaning |
+| --- | --- |
+| `silver_min_completed` / `gold_min_completed` | Minimum completed shipments needed for the tier |
+| `silver_max_disputed_ratio_bps` / `gold_max_disputed_ratio_bps` | Maximum `disputed × 10000 / completed` allowed for the tier |
+| `silver_multiplier_bps` / `gold_multiplier_bps` | Collateral multiplier for the tier, `≤ 10000`. Tiers can only reduce collateral (e.g. `7500` = 25% off) |
+| `bronze_max_value` / `silver_max_value` / `gold_max_value` | Per-tier shipment value cap (#560). `0` = unlimited and must not be negative |
+
+**Tier derivation.** Gold is checked first, then Silver. A supplier gets a tier only if they meet both its completed-count minimum and its dispute-ratio maximum. A supplier with no completed shipments is Bronze, and so is every supplier while no config is set. Bronze always pays the full base collateral.
+
+Function | Who | Behaviour
+--- | --- | ---
+`set_supplier_tier_config(admin, config)` | Admin | Stores the config. Panics if a multiplier is above `10000` or a max value is negative. Emits `supplier_tier_config_set`.
+`get_supplier_tier_config() → Option<SupplierTierConfig>` | Anyone (read-only) | `None` until configured.
+`get_supplier_tier(supplier) → SupplierTier` | Anyone (read-only) | The supplier's tier, computed from their current reputation.
+
+**Tier-change events (#478).** Whenever a supplier's reputation is updated, or their tier collateral discount is calculated at shipment creation, the tier is recomputed and compared with the last recorded tier (Bronze if none was recorded). If it has changed, the new tier is stored and `supplier_tier_changed` `(supplier, old_tier, new_tier)` is emitted. Calling `get_supplier_tier` never emits events and never updates the stored tier.
