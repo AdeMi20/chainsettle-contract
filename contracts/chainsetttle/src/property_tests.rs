@@ -345,6 +345,7 @@ mod contract_prop_tests {
                 inspected_milestones: vec![env],
                 proof_submitters: vec![env],
                 require_dual_attestation: false,
+                fund_from_vault: false,
             },
         );
     }
@@ -662,6 +663,7 @@ mod milestone_percent_fuzz {
                 inspected_milestones: vec![env],
                 proof_submitters: vec![env],
                 require_dual_attestation: false,
+                fund_from_vault: false,
             }
         }
 
