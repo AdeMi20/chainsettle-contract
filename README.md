@@ -2458,3 +2458,48 @@ Function | Who | Behaviour
 `report_condition_breach(oracle, shipment_id, milestone_index, data_hash)` | Group member | Records the report, emits `condition_breach_reported`, appends an audit entry. Duplicate reports from the same oracle are ignored. When distinct reports reach the group threshold, a dispute opens automatically on the milestone.
 
 Non-group callers are rejected. Threshold gating ensures a dispute opens only after enough distinct reports.
+
+### Shipment Summaries, Volume Counters, Dispute History & Ratings (#575–#578)
+
+Lightweight list views, cumulative volume analytics, full dispute history, and post-completion mutual ratings. New persistent keys live under `DataKeyExt4` (Ext3 was at capacity).
+
+#### Lightweight shipment summary (#575)
+
+Function | Who | Behaviour
+--- | --- | ---
+`get_shipment_summary(shipment_id)` | Anyone (read-only) | Returns `ShipmentSummary` (`id`, `status`, `buyers`, `supplier`, `token`, `total_amount`, `released_amount`, `milestone_count`, `open_disputes`, `created_at`) without `audit_log` or `milestones`. Panics if the ID is unknown.
+`get_shipment_summaries(ids)` | Anyone (read-only) | Batch variant. Unknown IDs are skipped. Panics if `ids.len()` exceeds the admin max.
+`set_max_summary_batch(admin, max)` / `get_max_summary_batch()` | Admin / anyone | Cap for the batch call (default `50`).
+
+#### Per-address earnings & spend by token (#576)
+
+On every supplier payout (confirm, held release, auto-confirm, dispute approve / finalize / timeout / mediation / panel, partial uncontested release), the contract updates:
+
+- `SupplierEarned(supplier, token)` — **net** amount paid to the supplier after platform / logistics / referral / arbiter fees
+- `BuyerSpent(buyer, token)` — **gross** amount released from escrow toward settlement (before fees)
+
+Refunds to the buyer never increment either counter. Both use checked arithmetic and panic on overflow.
+
+Function | Who | Behaviour
+--- | --- | ---
+`get_supplier_earnings(supplier, token)` | Anyone (read-only) | Cumulative net earnings for that token.
+`get_buyer_spend(buyer, token)` | Anyone (read-only) | Cumulative gross spend for that token.
+
+#### Paginated dispute history (#577)
+
+When a dispute terminates, a `DisputeRecord { shipment_id, milestone_index, opened_ledger, outcome }` is appended to **both** the primary buyer's and the supplier's histories (`DisputeOutcome`: `Buyer`, `Supplier`, or `Withdrawn`). Withdrawn disputes record `Withdrawn`. Outcomes reflect the final result after any appeal. Histories are append-only (ring-capped at 100) so pagination by index is stable while an entry remains.
+
+Function | Who | Behaviour
+--- | --- | ---
+`get_dispute_history(address, cursor, limit)` | Anyone (read-only) | Page of `DisputeRecord`s. `cursor` is a 0-based start index (`None` = 0); `limit` is clamped to 50.
+
+#### Mutual shipment ratings (#578)
+
+After a shipment reaches `Completed`, each party may rate the other once within an admin-configured ledger window (`0` = ratings disabled). Buyer rates the supplier; supplier rates the primary buyer. Stars must be `1..=5`. Averages use integer math: `average_x100 = (sum * 100) / count`.
+
+Function | Who | Behaviour
+--- | --- | ---
+`set_rating_window_ledgers(admin, window)` / `get_rating_window_ledgers()` | Admin / anyone | Ledgers after completion during which ratings are accepted.
+`rate_counterparty(caller, shipment_id, stars, comment_hash)` | Buyer or supplier | One rating per party per shipment. Emits `counterparty_rated` and writes an audit entry.
+`get_rating_summary(address)` | Anyone (read-only) | `(count, average_x100)`. `(0, 0)` if never rated.
+

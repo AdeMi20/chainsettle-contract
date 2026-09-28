@@ -75,3 +75,11 @@ pub const VERSION_PATCH: u32 = 0;
 /// Storage schema version written by `migrate` (#571). Bump when persistent
 /// layout changes require a post-upgrade migration.
 pub const STORAGE_SCHEMA_VERSION: u32 = 1;
+
+/// Default max shipment IDs accepted by `get_shipment_summaries` in one call
+/// when the admin has not configured an override (#575).
+pub const DEFAULT_MAX_SUMMARY_BATCH: u32 = 50;
+
+/// Maximum entries retained in a per-address dispute history (#577), ring-buffer
+/// style like `SHIPMENT_AUDIT_LOG_MAX_ENTRIES` (oldest dropped on overflow).
+pub const DISPUTE_HISTORY_MAX_ENTRIES: usize = 100;
