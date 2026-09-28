@@ -439,3 +439,227 @@ fn test_upcoming_deadlines_excludes_completed_and_cancelled() {
         0
     );
 }
+
+#[test]
+fn test_version_unchanged_by_migrate() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    let before = client.version();
+    client.migrate();
+    assert_eq!(client.version(), before);
+}
+
+#[test]
+fn test_get_shipments_by_arbiter_cursor_past_end_and_zero_limit() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    let shipment_id = String::from_str(&t.env, "ARB-EDGE-1");
+    create_standard_shipment(
+        &client,
+        &t.env,
+        &shipment_id,
+        &t.buyer,
+        &t.supplier,
+        &t.logistics,
+        &t.arbiter,
+        &t.token_id,
+        1_000_000,
+    );
+
+    assert_eq!(
+        client
+            .get_shipments_by_arbiter(&t.arbiter, &Some(1), &10)
+            .len(),
+        0
+    );
+    assert_eq!(
+        client
+            .get_shipments_by_arbiter(&t.arbiter, &Some(99), &10)
+            .len(),
+        0
+    );
+    assert_eq!(
+        client.get_shipments_by_arbiter(&t.arbiter, &None, &0).len(),
+        0
+    );
+}
+
+#[test]
+fn test_get_shipments_by_logistics_cursor_past_end_and_zero_limit() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    let shipment_id = String::from_str(&t.env, "LOG-EDGE-1");
+    create_standard_shipment(
+        &client,
+        &t.env,
+        &shipment_id,
+        &t.buyer,
+        &t.supplier,
+        &t.logistics,
+        &t.arbiter,
+        &t.token_id,
+        1_000_000,
+    );
+
+    assert_eq!(
+        client
+            .get_shipments_by_logistics(&t.logistics, &Some(1), &10)
+            .len(),
+        0
+    );
+    assert_eq!(
+        client
+            .get_shipments_by_logistics(&t.logistics, &None, &0)
+            .len(),
+        0
+    );
+    assert_eq!(
+        client
+            .get_shipments_by_logistics(&Address::generate(&t.env), &None, &10)
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn test_logistics_index_follows_chained_transfers() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    let shipment_id = String::from_str(&t.env, "LOG-CHAIN-1");
+    let second = Address::generate(&t.env);
+    let third = Address::generate(&t.env);
+
+    create_standard_shipment(
+        &client,
+        &t.env,
+        &shipment_id,
+        &t.buyer,
+        &t.supplier,
+        &t.logistics,
+        &t.arbiter,
+        &t.token_id,
+        1_000_000,
+    );
+
+    client.transfer_logistics(&t.logistics, &shipment_id, &second);
+    client.transfer_logistics(&second, &shipment_id, &third);
+
+    assert_eq!(
+        client
+            .get_shipments_by_logistics(&t.logistics, &None, &50)
+            .len(),
+        0
+    );
+    assert_eq!(
+        client
+            .get_shipments_by_logistics(&second, &None, &50)
+            .len(),
+        0
+    );
+    let third_list = client.get_shipments_by_logistics(&third, &None, &50);
+    assert_eq!(third_list.len(), 1);
+    assert_eq!(third_list.get(0).unwrap(), shipment_id);
+    assert_eq!(client.get_shipment(&shipment_id).logistics, third);
+}
+
+#[test]
+fn test_upcoming_deadlines_window_boundaries() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    t.env.ledger().set_sequence_number(100);
+
+    let shipment_id = String::from_str(&t.env, "DL-BOUND");
+    let mut milestones = build_milestones(&t.env);
+    let mut m0 = milestones.get(0).unwrap();
+    m0.deadline_ledger = 100; // == now → excluded
+    milestones.set(0, m0);
+    let mut m1 = milestones.get(1).unwrap();
+    m1.deadline_ledger = 150; // == window end → included
+    milestones.set(1, m1);
+    let mut m2 = milestones.get(2).unwrap();
+    m2.deadline_ledger = 151; // just past window → excluded
+    milestones.set(2, m2);
+
+    client.create_shipment(
+        &shipment_id,
+        &single_buyer_vec(&t.env, &t.buyer),
+        &t.supplier,
+        &t.logistics,
+        &t.arbiter,
+        &t.token_id,
+        &1_000_000i128,
+        &milestones,
+        &default_options(&t.env),
+    );
+
+    let results = client.get_upcoming_deadlines(&t.buyer, &50u32, &10u32);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results.get(0).unwrap(), (shipment_id, 1u32, 150u32));
+}
+
+#[test]
+fn test_upcoming_deadlines_ignores_milestones_without_deadline() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    let shipment_id = String::from_str(&t.env, "DL-NONE");
+    create_standard_shipment(
+        &client,
+        &t.env,
+        &shipment_id,
+        &t.buyer,
+        &t.supplier,
+        &t.logistics,
+        &t.arbiter,
+        &t.token_id,
+        1_000_000,
+    );
+
+    assert_eq!(
+        client
+            .get_upcoming_deadlines(&t.buyer, &u32::MAX, &50u32)
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn test_upcoming_deadlines_includes_proof_submitted_milestone() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    t.env.ledger().set_sequence_number(10);
+
+    let shipment_id = String::from_str(&t.env, "DL-PROOF");
+    let mut milestones = build_milestones(&t.env);
+    let mut m0 = milestones.get(0).unwrap();
+    m0.deadline_ledger = 40;
+    milestones.set(0, m0);
+
+    client.create_shipment(
+        &shipment_id,
+        &single_buyer_vec(&t.env, &t.buyer),
+        &t.supplier,
+        &t.logistics,
+        &t.arbiter,
+        &t.token_id,
+        &1_000_000i128,
+        &milestones,
+        &default_options(&t.env),
+    );
+
+    client.submit_proof(
+        &t.supplier,
+        &shipment_id,
+        &0,
+        &String::from_str(&t.env, "ipfs://proof"),
+        &Symbol::new(&t.env, "ipfs"),
+    );
+
+    let results = client.get_upcoming_deadlines(&t.supplier, &100u32, &10u32);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results.get(0).unwrap(), (shipment_id, 0u32, 40u32));
+}
