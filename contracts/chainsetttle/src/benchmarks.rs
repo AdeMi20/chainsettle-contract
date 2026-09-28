@@ -138,6 +138,7 @@ fn default_options(_env: &Env) -> ShipmentOptions {
         inspected_milestones: vec![_env],
         proof_submitters: vec![_env],
         require_dual_attestation: false,
+        fund_from_vault: false,
     }
 }
 
