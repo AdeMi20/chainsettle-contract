@@ -21,12 +21,16 @@ Invoice hash
 rebalance_milestones
 Milestone Payee Splits
 Partial Disputes & Escalation Checks
+Blacklist Appeal Process
+Supplier Cancel Cooldown
 
 Milestone Completion Percentage
 
+Resolution Finality Delay
 Dispute Evidence Submission
 
 Advance Payment Lifecycle
+Milestone Notes
 Milestone Amendment History Tracking
 Supplier Payout Batching
 Admin Succession & Emergency Recovery
@@ -841,6 +845,52 @@ milestone, or `0` when no deadline has been set.
 Extension request, approval, and denial calls are paused by the emergency
 circuit breaker; `get_milestone_deadline` remains available while paused.
 
+### Milestone Notes
+
+Shipment participants (buyers, suppliers, and logistics providers) can append informational notes to a milestone. This feature is useful for providing context, updates, or linking additional off-chain references without changing the milestone's state or payment amount.
+
+**Important:** Notes are informational only and **do not affect payouts, completion status, or escrow balances**. 
+
+A maximum of 10 notes can be attached per milestone. If a new note is added when there are already 10, the oldest note is removed (FIFO).
+
+Function | Who | Behaviour
+--- | --- | ---
+`add_milestone_note(caller, shipment_id, milestone_index, note)` | Buyer, Supplier, or Logistics | Appends an informational note to the specified milestone. The shipment must be `Active`.
+`get_milestone_notes(shipment_id, milestone_index) → Vec<MilestoneNote>` | Anyone (read-only) | Returns the list of notes for the milestone. Returns an empty list if there are no notes.
+
+**MilestoneNote Struct**
+
+```rust
+pub struct MilestoneNote {
+    pub author: Address,   // The address of the participant who added the note
+    pub note: String,      // The informational content of the note
+    pub ledger: u32,       // The ledger sequence when the note was added
+}
+```
+
+**Usage Example:**
+
+```bash
+# Add an informational note to milestone 0
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --source supplier-account \
+  --network testnet \
+  -- add_milestone_note \
+  --caller <SUPPLIER_ADDRESS> \
+  --shipment_id "SHIP-2026-001" \
+  --milestone_index 0 \
+  --note "Goods have arrived at the intermediate warehouse."
+
+# Fetch notes for the milestone
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --network testnet \
+  -- get_milestone_notes \
+  --shipment_id "SHIP-2026-001" \
+  --milestone_index 0
+```
+
 Milestone Amendment History Tracking
 Buyer and supplier can mutually agree to change a **Pending** milestone's payment percentage and/or name after a shipment is created — for example, to fix a typo in the milestone name or rebalance value between milestones before any proof is submitted. Changes only take effect once **both parties agree on the exact same terms**.
 
@@ -1224,6 +1274,42 @@ cap is checked first (`"DisputeAlreadyOpen"`), then the buyer's cap
 
 ---
 
+### Resolution Finality Delay
+
+When a dispute is resolved in the supplier's favour (e.g. by an arbiter approving the evidence), the funds can be delayed before they are transferred. This finality delay provides a grace period for the buyer to catch and act on an arbiter error before the funds leave escrow.
+
+Function | Who | Behaviour
+--- | --- | ---
+`set_finality_delay_ledgers(admin, ledgers)` | Admin only | Sets the global delay in ledgers that must pass before a dispute resolved in favour of the supplier actually releases funds. Setting this to `0` (the default) disables the delay, meaning funds are released immediately upon resolution.
+`get_finality_delay_ledgers() → u32` | Anyone (read-only) | Returns the configured delay in ledgers.
+`finalize_dispute_resolution(shipment_id, milestone_index)` | Anyone (permissionless) | Actually pays out a dispute that was ruled in the supplier's favour. Can only be called once the finality delay has elapsed.
+
+**What the buyer should do during the delay:**
+If the buyer spots an arbiter error or disagreement during the delay window, they should call `appeal_dispute` to reopen the milestone before the delay expires. Once a milestone is reopened as `Disputed` through an appeal, `finalize_dispute_resolution` will fail. 
+
+**Usage Example:**
+
+```bash
+# Admin configures a delay of 500 ledgers
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --source admin-account \
+  --network testnet \
+  -- set_finality_delay_ledgers \
+  --admin <ADMIN_ADDRESS> \
+  --ledgers 500
+
+# Anyone finalizes the payout once the delay has elapsed
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --network testnet \
+  -- finalize_dispute_resolution \
+  --shipment_id "SHIP-2026-001" \
+  --milestone_index 0
+```
+
+---
+
 Dispute Evidence Submission
 Once a milestone is `Disputed`, the parties involved can attach supporting
 evidence on-chain, and — for shipments created with an arbiter panel — panel
@@ -1416,6 +1502,51 @@ address from the blacklist only removes that denial; the supplier must still
 be on a non-empty whitelist to be eligible. Neither control changes an
 already-created shipment.
 
+### Blacklist Appeal Process
+
+When an address is blacklisted, they can file an appeal for admin review to be removed from the blacklist. This provides a transparent resolution mechanism if a party believes they were mistakenly blocked.
+
+Only a currently blacklisted address may file an appeal, and only one open appeal is allowed per address at any given time.
+
+Function | Who | Behaviour
+--- | --- | ---
+`appeal_blacklist(address, evidence_hash)` | Blacklisted Address | Files an appeal against an active blacklist status. The `evidence_hash` should be an IPFS CID or similar off-chain link supporting the appeal.
+`get_blacklist_appeal(address) → Option<BlacklistAppeal>` | Anyone (read-only) | Returns the current appeal for the address, if one exists.
+`review_blacklist_appeal(admin, address, approve: bool)` | Admin only | Admin reviews the pending appeal. If `approve` is `true`, the address is removed from the blacklist and the appeal status becomes `Approved`. If `false`, the address remains blacklisted and the appeal status becomes `Rejected`. Either way, the appeal is permanently decided.
+
+**BlacklistAppeal Struct**
+
+```rust
+pub struct BlacklistAppeal {
+    pub evidence_hash: String,            // IPFS CID or other off-chain evidence pointer
+    pub status: BlacklistAppealStatus,    // Pending | Approved | Rejected
+    pub filed_ledger: u32,                // Ledger sequence at which the appeal was filed
+}
+```
+
+**Usage Example:**
+
+```bash
+# File an appeal providing evidence
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --source blacklisted-account \
+  --network testnet \
+  -- appeal_blacklist \
+  --address <BLACKLISTED_ADDRESS> \
+  --evidence_hash "ipfs://bafybeihd..."
+
+# Admin reviews and approves the appeal
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --source admin-account \
+  --network testnet \
+  -- review_blacklist_appeal \
+  --admin <ADMIN_ADDRESS> \
+  --address <BLACKLISTED_ADDRESS> \
+  --approve true
+```
+
 ### Reputation-Triggered Auto-Blacklisting
 
 In addition to manual blacklisting (`blacklist_address()`), the contract supports automatic blacklisting based on a supplier's reputation counters. 
@@ -1488,6 +1619,50 @@ stellar contract invoke \
   --id <CONTRACT_ID> \
   --network testnet \
   -- get_supplier_exposure \
+  --supplier <SUPPLIER_ADDRESS>
+```
+
+### Supplier Cancel Cooldown
+
+Admins can rate-limit how often a specific supplier can cancel shipments. This prevents abuse or spamming of the `supplier_cancel` function by setting a cap on cancellations within a rolling time window.
+
+Function | Who | Behaviour
+--- | --- | ---
+`set_supplier_cancel_cooldown(admin, supplier, max_cancellations, window_ledgers, cooldown_ledgers)` | Admin only | Sets the cancel limit for a specific supplier.
+`get_supplier_cancel_cooldown(supplier) → Option<(u32, u32, u32)>` | Anyone (read-only) | Returns the configured limit for the supplier as `(max_cancellations, window_ledgers, cooldown_ledgers)`. Returns `None` if no limit is configured.
+
+**Configuration Parameters:**
+- `max_cancellations`: The maximum number of times the supplier can cancel shipments before triggering the cooldown. Setting this to `0` clears and disables the limit for the supplier. By default, suppliers have no limit configured.
+- `window_ledgers`: The rolling time window (in ledgers) over which cancellations are counted.
+- `cooldown_ledgers`: The duration (in ledgers) the supplier is blocked from cancelling further shipments once they hit the cap.
+
+**Timeline Example:**
+Assume an admin configures a supplier with `max_cancellations` = 2, `window_ledgers` = 1000, `cooldown_ledgers` = 5000.
+1. **Ledger 100**: Supplier cancels shipment A. (Count: 1)
+2. **Ledger 500**: Supplier cancels shipment B. (Count: 2 - Cap hit!)
+3. **Ledger 600**: Supplier attempts to cancel shipment C. **Blocked!** (cooldown is active until Ledger 5500, which is `500 + 5000`).
+4. **Ledger 5501**: Cooldown expires. The supplier can cancel shipments again.
+
+**Usage Example:**
+
+```bash
+# Configure cooldown for a supplier (max 3 cancels per 10,000 ledgers, 50,000 ledger cooldown)
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --source admin-account \
+  --network testnet \
+  -- set_supplier_cancel_cooldown \
+  --admin <ADMIN_ADDRESS> \
+  --supplier <SUPPLIER_ADDRESS> \
+  --max_cancellations 3 \
+  --window_ledgers 10000 \
+  --cooldown_ledgers 50000
+
+# Query the supplier's configuration
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --network testnet \
+  -- get_supplier_cancel_cooldown \
   --supplier <SUPPLIER_ADDRESS>
 ```
 
