@@ -1468,6 +1468,71 @@ pub enum DataKeyExt3 {
     ConditionBreachReports(String, u32),
 }
 
+/// `DataKeyExt3` is at the 50-variant XDR ceiling, so keys added from here on
+/// live in this enum. It also re-homes the ten `DataKeyExt3` variants that a
+/// bad merge on `main` dropped from the enum while leaving their call sites
+/// intact (which broke `cargo build`); the key *values* were never released, so
+/// repointing them here restores the storage layout those features expect.
+#[contracttype]
+pub enum DataKeyExt4 {
+    // ── #571 Contract / storage schema versioning ─────────────────────────
+    /// Instance-stored schema version set by `migrate` after upgrades.
+    StorageSchemaVersion,
+
+    // ── #572 Arbiter → shipments index ────────────────────────────────────
+    /// Shipment IDs currently assigned to a given arbiter.
+    ArbiterShipments(Address),
+
+    // ── #573 Logistics → shipments index ──────────────────────────────────
+    /// Shipment IDs involving a given logistics provider.
+    LogisticsShipments(Address),
+
+    // ── #528 Clean-completion fee rebate ──────────────────────────────────
+    /// Admin-configured share (bps) of platform fees refunded to the supplier
+    /// when a shipment completes with zero disputes (0/absent = disabled).
+    CleanCompletionRebateBps,
+    /// Cumulative platform fees collected for a shipment (token units).
+    ShipmentFeesPaid(String),
+    /// Set once any dispute is raised on the shipment (absent = never disputed).
+    ShipmentHadDispute(String),
+
+    // ── #531 Arbiter stake slashing on overturn ───────────────────────────
+    /// Admin-configured share (bps) of an arbiter's stake forfeited to the
+    /// wronged party when an appeal overturns their resolution (0 = disabled).
+    ArbiterSlashBps,
+    /// Locked arbiter stake: (token, amount).
+    ArbiterStake(Address),
+
+    // ── #552 Substitute supplier for a defaulted milestone ────────────────
+    /// Pending substitute-supplier proposal for (shipment_id, milestone_index).
+    SubstituteProposal(String, u32),
+    /// Approved substitute supplier for (shipment_id, milestone_index).
+    MilestoneSupplier(String, u32),
+
+    // ── #549 Mutual extension of shipment expiry ──────────────────────────
+    /// Admin-configured ceiling on the total number of ledgers a shipment's
+    /// expiry may be extended by across all approved extensions
+    /// (0/unset = no ceiling enforced).
+    MaxExpiryExtensionLedgers,
+    /// Pending mutually-agreed expiry extension for a shipment.
+    PendingExpiryExtension(String),
+    /// Total ledgers a shipment's expiry has already been extended by, so the
+    /// admin ceiling applies cumulatively rather than per extension.
+    TotalExpiryExtended(String),
+}
+
+/// #549 – Pending proposal to move a shipment's `expires_at_ledger` later.
+#[contracttype]
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ExpiryExtensionProposal {
+    pub proposer: Address,
+    /// Expiry ledger requested by `proposer`.
+    pub new_expiry_ledger: u32,
+    /// Expiry ledger in force when the proposal was made; re-checked on
+    /// approval so a proposal can never be applied on top of a stale base.
+    pub base_expiry_ledger: u32,
+}
+
 /// #517 – Pending proposal to merge two adjacent Pending milestones.
 #[contracttype]
 #[derive(Clone, PartialEq, Debug)]
@@ -1680,7 +1745,7 @@ impl ChainSettleContract {
     /// Sets / bumps the instance-stored storage schema version (#571).
     pub fn migrate(env: Env) {
         env.storage().instance().set(
-            &DataKeyExt3::StorageSchemaVersion,
+            &DataKeyExt4::StorageSchemaVersion,
             &constants::STORAGE_SCHEMA_VERSION,
         );
     }
@@ -1700,7 +1765,7 @@ impl ChainSettleContract {
     pub fn storage_schema_version(env: Env) -> u32 {
         env.storage()
             .instance()
-            .get(&DataKeyExt3::StorageSchemaVersion)
+            .get(&DataKeyExt4::StorageSchemaVersion)
             .unwrap_or(0)
     }
 
@@ -5648,12 +5713,12 @@ impl ChainSettleContract {
         // #572 / #573: Index by arbiter and logistics for party dashboards.
         Self::add_to_party_index(
             &env,
-            DataKeyExt3::ArbiterShipments(arbiter.clone()),
+            DataKeyExt4::ArbiterShipments(arbiter.clone()),
             &shipment_id,
         );
         Self::add_to_party_index(
             &env,
-            DataKeyExt3::LogisticsShipments(logistics.clone()),
+            DataKeyExt4::LogisticsShipments(logistics.clone()),
             &shipment_id,
         );
 
@@ -9860,12 +9925,12 @@ impl ChainSettleContract {
 
         Self::remove_from_party_index(
             &env,
-            DataKeyExt3::LogisticsShipments(current_logistics.clone()),
+            DataKeyExt4::LogisticsShipments(current_logistics.clone()),
             &shipment_id,
         );
         Self::add_to_party_index(
             &env,
-            DataKeyExt3::LogisticsShipments(new_logistics.clone()),
+            DataKeyExt4::LogisticsShipments(new_logistics.clone()),
             &shipment_id,
         );
 
@@ -11437,6 +11502,169 @@ impl ChainSettleContract {
     }
 
     // ----------------------------------------------------------
+    // #549 — MUTUAL EXPIRY EXTENSION
+    // ----------------------------------------------------------
+
+    /// #549: Admin sets the maximum total number of ledgers a shipment's
+    /// `expires_at_ledger` may be extended by, counted cumulatively across all
+    /// approved extensions. 0 (the default) means extensions are unlimited.
+    pub fn set_max_expiry_extension_ledgers(env: Env, admin: Address, ledgers: u32) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKeyExt4::MaxExpiryExtensionLedgers, &ledgers);
+        env.events()
+            .publish((Symbol::new(&env, "max_expiry_ext_set"),), ledgers);
+    }
+
+    /// Returns the configured maximum total expiry extension in ledgers
+    /// (0 = unlimited).
+    pub fn get_max_expiry_extension_ledgers(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKeyExt4::MaxExpiryExtensionLedgers)
+            .unwrap_or(0)
+    }
+
+    /// Buyer or supplier proposes moving the shipment's expiry later. Nothing
+    /// changes on-chain except the pending proposal; the counterparty must call
+    /// `approve_expiry_extension` for the new expiry to take effect.
+    pub fn propose_expiry_extension(
+        env: Env,
+        caller: Address,
+        shipment_id: String,
+        new_expiry_ledger: u32,
+    ) {
+        env.storage()
+            .instance()
+            .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+
+        let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        Self::assert_shipment_not_paused(&env, &shipment_id);
+        Self::assert_buyer_or_supplier(&shipment, &caller);
+
+        let current = Self::assert_extendable_expiry(&env, &shipment, &new_expiry_ledger);
+
+        let key = DataKeyExt4::PendingExpiryExtension(shipment_id.clone());
+        let proposal = ExpiryExtensionProposal {
+            proposer: caller.clone(),
+            new_expiry_ledger,
+            base_expiry_ledger: current,
+        };
+        Self::set_persistent4(&env, &key, &proposal);
+
+        Self::append_audit_entry(
+            &env,
+            &mut shipment,
+            caller.clone(),
+            Symbol::new(&env, "expiry_ext_proposed"),
+            Symbol::new(&env, "propose_expiry_extension"),
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "expiry_extension_proposed"),
+                shipment_id,
+            ),
+            (caller, current, new_expiry_ledger),
+        );
+    }
+
+    /// The counterparty approves the pending expiry extension, which moves
+    /// `expires_at_ledger` to the requested ledger. Re-validates every
+    /// precondition, so a proposal cannot be applied once the shipment has
+    /// expired or the admin ceiling has been lowered in the meantime.
+    pub fn approve_expiry_extension(env: Env, counterparty: Address, shipment_id: String) {
+        env.storage()
+            .instance()
+            .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
+        Self::assert_not_paused(&env);
+        counterparty.require_auth();
+
+        let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        Self::assert_shipment_not_paused(&env, &shipment_id);
+        Self::assert_buyer_or_supplier(&shipment, &counterparty);
+
+        let key = DataKeyExt4::PendingExpiryExtension(shipment_id.clone());
+        let proposal: ExpiryExtensionProposal = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic!("no pending expiry extension"));
+        if proposal.proposer == counterparty {
+            panic!("cannot approve own expiry extension");
+        }
+        // The proposer was a party when the proposal was made; require the
+        // approver to be the *other* side so both buyer and supplier consent.
+        if proposal.proposer == shipment.supplier {
+            if !Self::is_buyer(&shipment, &counterparty) {
+                panic!("expiry extension must be approved by a buyer");
+            }
+        } else if counterparty != shipment.supplier {
+            panic!("expiry extension must be approved by the supplier");
+        }
+
+        let old_expiry =
+            Self::assert_extendable_expiry(&env, &shipment, &proposal.new_expiry_ledger);
+        if old_expiry != proposal.base_expiry_ledger {
+            panic!("pending expiry extension is stale");
+        }
+        // `assert_extendable_expiry` guarantees new > old, so the delta is safe.
+        let delta = proposal.new_expiry_ledger - old_expiry;
+
+        let total_key = DataKeyExt4::TotalExpiryExtended(shipment_id.clone());
+        let already: u32 = env.storage().persistent().get(&total_key).unwrap_or(0);
+        Self::assert_within_max_expiry_extension(&env, already.saturating_add(delta));
+
+        env.storage().persistent().remove(&key);
+        Self::set_persistent4(&env, &total_key, &already.saturating_add(delta));
+
+        shipment.expires_at_ledger = Some(proposal.new_expiry_ledger);
+        Self::append_audit_entry(
+            &env,
+            &mut shipment,
+            counterparty.clone(),
+            Symbol::new(&env, "expiry_extended"),
+            Symbol::new(&env, "approve_expiry_extension"),
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+
+        env.events().publish(
+            (Symbol::new(&env, "expiry_extended"), shipment_id),
+            (old_expiry, proposal.new_expiry_ledger, counterparty),
+        );
+    }
+
+    /// Returns the pending expiry extension for a shipment, if any.
+    pub fn get_pending_expiry_extension(env: Env, shipment_id: String) -> Option<ExpiryExtensionProposal> {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt4::PendingExpiryExtension(shipment_id))
+    }
+
+    /// Returns the total ledgers a shipment's expiry has been extended by.
+    pub fn get_total_expiry_extended(env: Env, shipment_id: String) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt4::TotalExpiryExtended(shipment_id))
+            .unwrap_or(0)
+    }
+
+    // ----------------------------------------------------------
     // #546 — ORACLE CONDITION BREACH → AUTO DISPUTE
     // ----------------------------------------------------------
 
@@ -12115,7 +12343,7 @@ impl ChainSettleContract {
         }
         env.storage()
             .instance()
-            .set(&DataKeyExt3::CleanCompletionRebateBps, &bps);
+            .set(&DataKeyExt4::CleanCompletionRebateBps, &bps);
         env.events()
             .publish((Symbol::new(&env, "clean_completion_rebate_bps_set"),), bps);
     }
@@ -12124,7 +12352,7 @@ impl ChainSettleContract {
     pub fn get_clean_completion_rebate_bps(env: Env) -> u32 {
         env.storage()
             .instance()
-            .get(&DataKeyExt3::CleanCompletionRebateBps)
+            .get(&DataKeyExt4::CleanCompletionRebateBps)
             .unwrap_or(0)
     }
 
@@ -12132,7 +12360,7 @@ impl ChainSettleContract {
     pub fn get_shipment_fees_paid(env: Env, shipment_id: String) -> i128 {
         env.storage()
             .persistent()
-            .get(&DataKeyExt3::ShipmentFeesPaid(shipment_id))
+            .get(&DataKeyExt4::ShipmentFeesPaid(shipment_id))
             .unwrap_or(0)
     }
 
@@ -12150,7 +12378,7 @@ impl ChainSettleContract {
         }
         env.storage()
             .instance()
-            .set(&DataKeyExt3::ArbiterSlashBps, &bps);
+            .set(&DataKeyExt4::ArbiterSlashBps, &bps);
         env.events()
             .publish((Symbol::new(&env, "arbiter_slash_bps_set"),), bps);
     }
@@ -12159,7 +12387,7 @@ impl ChainSettleContract {
     pub fn get_arbiter_slash_bps(env: Env) -> u32 {
         env.storage()
             .instance()
-            .get(&DataKeyExt3::ArbiterSlashBps)
+            .get(&DataKeyExt4::ArbiterSlashBps)
             .unwrap_or(0)
     }
 
@@ -12172,7 +12400,7 @@ impl ChainSettleContract {
         let token_client = token::Client::new(&env, &token);
         token_client.transfer(&arbiter, &env.current_contract_address(), &amount);
 
-        let key = DataKeyExt3::ArbiterStake(arbiter.clone());
+        let key = DataKeyExt4::ArbiterStake(arbiter.clone());
         let (existing_token, existing_amt): (Address, i128) = env
             .storage()
             .persistent()
@@ -12200,7 +12428,7 @@ impl ChainSettleContract {
     pub fn get_arbiter_stake(env: Env, arbiter: Address) -> i128 {
         env.storage()
             .persistent()
-            .get::<DataKeyExt3, (Address, i128)>(&DataKeyExt3::ArbiterStake(arbiter))
+            .get::<DataKeyExt4, (Address, i128)>(&DataKeyExt4::ArbiterStake(arbiter))
             .map(|(_, amt)| amt)
             .unwrap_or(0)
     }
@@ -12242,7 +12470,7 @@ impl ChainSettleContract {
             panic!("milestone is not overdue");
         }
 
-        let key = DataKeyExt3::SubstituteProposal(shipment_id.clone(), milestone_index);
+        let key = DataKeyExt4::SubstituteProposal(shipment_id.clone(), milestone_index);
         env.storage()
             .persistent()
             .set(&key, &new_supplier);
@@ -12300,7 +12528,7 @@ impl ChainSettleContract {
             panic!("milestone is not overdue");
         }
 
-        let proposal_key = DataKeyExt3::SubstituteProposal(shipment_id.clone(), milestone_index);
+        let proposal_key = DataKeyExt4::SubstituteProposal(shipment_id.clone(), milestone_index);
         let new_supplier: Address = env
             .storage()
             .persistent()
@@ -12308,7 +12536,7 @@ impl ChainSettleContract {
             .unwrap_or_else(|| panic!("no substitute proposal"));
         env.storage().persistent().remove(&proposal_key);
 
-        let supplier_key = DataKeyExt3::MilestoneSupplier(shipment_id.clone(), milestone_index);
+        let supplier_key = DataKeyExt4::MilestoneSupplier(shipment_id.clone(), milestone_index);
         env.storage()
             .persistent()
             .set(&supplier_key, &new_supplier);
@@ -12347,7 +12575,7 @@ impl ChainSettleContract {
     ) -> Option<Address> {
         env.storage()
             .persistent()
-            .get(&DataKeyExt3::MilestoneSupplier(shipment_id, milestone_index))
+            .get(&DataKeyExt4::MilestoneSupplier(shipment_id, milestone_index))
     }
 
     // ----------------------------------------------------------
@@ -14054,7 +14282,7 @@ impl ChainSettleContract {
         let list: Vec<String> = env
             .storage()
             .persistent()
-            .get(&DataKeyExt3::ArbiterShipments(arbiter))
+            .get(&DataKeyExt4::ArbiterShipments(arbiter))
             .unwrap_or_else(|| Vec::new(&env));
         Self::paginate_shipment_ids(&env, &list, cursor, limit)
     }
@@ -14072,7 +14300,7 @@ impl ChainSettleContract {
         let list: Vec<String> = env
             .storage()
             .persistent()
-            .get(&DataKeyExt3::LogisticsShipments(logistics))
+            .get(&DataKeyExt4::LogisticsShipments(logistics))
             .unwrap_or_else(|| Vec::new(&env));
         Self::paginate_shipment_ids(&env, &list, cursor, limit)
     }
@@ -14342,6 +14570,50 @@ impl ChainSettleContract {
     fn assert_buyer_or_supplier(shipment: &Shipment, caller: &Address) {
         if !Self::is_buyer(shipment, caller) && *caller != shipment.supplier {
             panic!("unauthorized");
+        }
+    }
+
+    /// #549: Shared precondition for proposing/approving an expiry extension.
+    /// Returns the shipment's current expiry ledger after checking that a
+    /// shipment exists, that it is still extendable, that the requested expiry
+    /// is genuinely later, and that the request fits the admin ceiling.
+    fn assert_extendable_expiry(
+        env: &Env,
+        shipment: &Shipment,
+        new_expiry_ledger: &u32,
+    ) -> u32 {
+        let current = shipment
+            .expires_at_ledger
+            .unwrap_or_else(|| panic!("shipment has no expiry"));
+        let now = env.ledger().sequence();
+        if now >= current {
+            panic!("shipment has already expired");
+        }
+        if *new_expiry_ledger <= current {
+            panic!("new expiry must be later than current expiry");
+        }
+        let already: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt4::TotalExpiryExtended(shipment.id.clone()))
+            .unwrap_or(0);
+        Self::assert_within_max_expiry_extension(
+            env,
+            already.saturating_add(new_expiry_ledger - current),
+        );
+        current
+    }
+
+    /// #549: Rejects a cumulative extension larger than the admin-configured
+    /// maximum. A maximum of 0 disables the ceiling.
+    fn assert_within_max_expiry_extension(env: &Env, total_extension: u32) {
+        let max: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKeyExt4::MaxExpiryExtensionLedgers)
+            .unwrap_or(0);
+        if max > 0 && total_extension > max {
+            panic!("expiry extension exceeds maximum allowed");
         }
     }
 
@@ -14668,7 +14940,7 @@ impl ChainSettleContract {
         let supplier = env
             .storage()
             .persistent()
-            .get::<DataKeyExt3, Address>(&DataKeyExt3::MilestoneSupplier(
+            .get::<DataKeyExt4, Address>(&DataKeyExt4::MilestoneSupplier(
                 shipment_id.clone(),
                 milestone_index,
             ))
@@ -15535,7 +15807,7 @@ impl ChainSettleContract {
         if fee <= 0 {
             return;
         }
-        let key = DataKeyExt3::ShipmentFeesPaid(shipment_id.clone());
+        let key = DataKeyExt4::ShipmentFeesPaid(shipment_id.clone());
         let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
         env.storage().persistent().set(&key, &(current + fee));
         env.storage().persistent().extend_ttl(
@@ -15547,7 +15819,7 @@ impl ChainSettleContract {
 
     /// #528: Mark that at least one dispute was raised on this shipment.
     fn mark_shipment_had_dispute(env: &Env, shipment_id: &String) {
-        let key = DataKeyExt3::ShipmentHadDispute(shipment_id.clone());
+        let key = DataKeyExt4::ShipmentHadDispute(shipment_id.clone());
         env.storage().persistent().set(&key, &true);
         env.storage().persistent().extend_ttl(
             &key,
@@ -15565,7 +15837,7 @@ impl ChainSettleContract {
     ) -> Address {
         env.storage()
             .persistent()
-            .get(&DataKeyExt3::MilestoneSupplier(
+            .get(&DataKeyExt4::MilestoneSupplier(
                 shipment_id.clone(),
                 milestone_index,
             ))
@@ -15582,7 +15854,7 @@ impl ChainSettleContract {
         let bps: u32 = env
             .storage()
             .instance()
-            .get(&DataKeyExt3::CleanCompletionRebateBps)
+            .get(&DataKeyExt4::CleanCompletionRebateBps)
             .unwrap_or(0);
         if bps == 0 {
             return;
@@ -15590,7 +15862,7 @@ impl ChainSettleContract {
         let had_dispute: bool = env
             .storage()
             .persistent()
-            .get(&DataKeyExt3::ShipmentHadDispute(shipment_id.clone()))
+            .get(&DataKeyExt4::ShipmentHadDispute(shipment_id.clone()))
             .unwrap_or(false);
         if had_dispute {
             return;
@@ -15598,7 +15870,7 @@ impl ChainSettleContract {
         let fees_paid: i128 = env
             .storage()
             .persistent()
-            .get(&DataKeyExt3::ShipmentFeesPaid(shipment_id.clone()))
+            .get(&DataKeyExt4::ShipmentFeesPaid(shipment_id.clone()))
             .unwrap_or(0);
         if fees_paid <= 0 {
             return;
@@ -15680,16 +15952,16 @@ impl ChainSettleContract {
         let slash_bps: u32 = env
             .storage()
             .instance()
-            .get(&DataKeyExt3::ArbiterSlashBps)
+            .get(&DataKeyExt4::ArbiterSlashBps)
             .unwrap_or(0);
         if slash_bps == 0 {
             return;
         }
-        let stake_key = DataKeyExt3::ArbiterStake(original_arbiter.clone());
+        let stake_key = DataKeyExt4::ArbiterStake(original_arbiter.clone());
         let Some((stake_token, stake_amt)) = env
             .storage()
             .persistent()
-            .get::<DataKeyExt3, (Address, i128)>(&stake_key)
+            .get::<DataKeyExt4, (Address, i128)>(&stake_key)
         else {
             return;
         };
@@ -15960,7 +16232,7 @@ impl ChainSettleContract {
     }
 
     /// Append a shipment ID to a party index (`ArbiterShipments` / `LogisticsShipments`).
-    fn add_to_party_index(env: &Env, key: DataKeyExt3, shipment_id: &String) {
+    fn add_to_party_index(env: &Env, key: DataKeyExt4, shipment_id: &String) {
         let mut list: Vec<String> = env
             .storage()
             .persistent()
@@ -15982,7 +16254,7 @@ impl ChainSettleContract {
     }
 
     /// Remove the first matching shipment ID from a party index.
-    fn remove_from_party_index(env: &Env, key: DataKeyExt3, shipment_id: &String) {
+    fn remove_from_party_index(env: &Env, key: DataKeyExt4, shipment_id: &String) {
         let list: Vec<String> = env
             .storage()
             .persistent()
@@ -16008,10 +16280,10 @@ impl ChainSettleContract {
         }
         Self::remove_from_party_index(
             env,
-            DataKeyExt3::ArbiterShipments(old.clone()),
+            DataKeyExt4::ArbiterShipments(old.clone()),
             shipment_id,
         );
-        Self::add_to_party_index(env, DataKeyExt3::ArbiterShipments(new.clone()), shipment_id);
+        Self::add_to_party_index(env, DataKeyExt4::ArbiterShipments(new.clone()), shipment_id);
     }
 
     /// Cursor/limit page over a shipment-ID list (stable, non-overlapping).
@@ -17364,6 +17636,15 @@ impl ChainSettleContract {
         );
     }
 
+    fn set_persistent4<V: IntoVal<Env, Val>>(env: &Env, key: &DataKeyExt4, value: &V) {
+        env.storage().persistent().set(key, value);
+        env.storage().persistent().extend_ttl(
+            key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+    }
+
     fn decrease_total_escrowed(env: &Env, token: &Address, amount: i128) {
         let key = DataKey::TotalEscrowed(token.clone());
         let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
@@ -17761,6 +18042,7 @@ mod test_rate_limit_exemption;
 mod test_arbiter_repetition_guard;
 mod test_trade_proof;
 mod test_pause_notice;
+mod test_expiry_extension;
 mod test_buyer_cap_collateral_merge;
 mod test_feat_issues;
 // Disabled: exercises milestone insurance holdback / oracle price-condition

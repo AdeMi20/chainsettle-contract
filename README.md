@@ -829,6 +829,24 @@ milestone, or `0` when no deadline has been set.
 Extension request, approval, and denial calls are paused by the emergency
 circuit breaker; `get_milestone_deadline` remains available while paused.
 
+Mutual Shipment Expiry Extension
+Buyer and supplier can jointly extend a shipment's `expires_at_ledger` when legitimate delays occur. The flow requires mutual consent: one party proposes a new expiry ledger, and the other party must approve it before the change takes effect.
+`set_max_expiry_extension_ledgers(admin, ledgers)` — admin only. Sets the maximum total number of ledgers a shipment's expiry may be extended by across all approved extensions. `0` (the default) means unlimited. Emits `max_expiry_ext_set`.
+`get_max_expiry_extension_ledgers() → u32` (read-only) — returns the configured ceiling.
+`propose_expiry_extension(caller, shipment_id, new_expiry_ledger)` — buyer or supplier. Proposes moving the shipment's expiry to `new_expiry_ledger`. The shipment must be `Active`, have an existing expiry, not be expired yet, and the new expiry must be later than the current one. The proposal is stored and emits `expiry_extension_proposed`.
+`approve_expiry_extension(counterparty, shipment_id)` — the other party. Approves the pending proposal, moves `expires_at_ledger` to the requested ledger, records the cumulative extension against the admin ceiling, clears the proposal, and emits `expiry_extended` with the old and new expiry ledgers. Re-validates all preconditions (shipment still active, not expired, cumulative extension within ceiling, proposal not stale).
+`get_pending_expiry_extension(shipment_id) → Option<ExpiryExtensionProposal>` (read-only) — returns the pending proposal with proposer, requested expiry, and base expiry.
+`get_total_expiry_extended(shipment_id) → u32` (read-only) — returns the cumulative ledgers the shipment's expiry has been extended by so far.
+Rules:
+- Only the buyer or supplier may propose; the counterparty must approve (a party cannot approve its own proposal).
+- The shipment must have an `expires_at_ledger` set at creation; shipments without expiry cannot use this feature.
+- An expired shipment cannot be extended (checked against current ledger at both propose and approve time).
+- Extensions are cumulative: the admin ceiling applies to the sum of all deltas across the shipment's lifetime.
+- A cancelled or completed shipment cannot be extended.
+- A paused contract or paused shipment blocks proposal and approval calls.
+- Events: `expiry_extension_proposed(proposer, current_expiry, new_expiry)` and `expiry_extended(old_expiry, new_expiry, approver)`.
+- Audit log: `expiry_ext_proposed` on proposal, `expiry_extended` on approval.
+
 Milestone Amendment History Tracking
 Buyer and supplier can mutually agree to change a **Pending** milestone's payment percentage and/or name after a shipment is created — for example, to fix a typo in the milestone name or rebalance value between milestones before any proof is submitted. Changes only take effect once **both parties agree on the exact same terms**.
 
