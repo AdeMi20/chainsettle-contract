@@ -2515,3 +2515,148 @@ Function | Who | Behaviour
 `rate_counterparty(caller, shipment_id, stars, comment_hash)` | Buyer or supplier | One rating per party per shipment. Emits `counterparty_rated` and writes an audit entry.
 `get_rating_summary(address)` | Anyone (read-only) | `(count, average_x100)`. `(0, 0)` if never rated.
 
+### Co-Buyer Joint Confirmation (#367)
+
+High-value shipments can require both the buyer and a designated co-buyer to confirm a milestone before funds are released. The threshold is admin-controlled; shipments at or below the threshold use the normal single-buyer confirmation flow.
+
+**How it works:** The buyer designates a co-buyer once, before the shipment progresses. When the shipment value exceeds the configured threshold, `confirm_milestone` requires both the buyer and the co-buyer to call it independently. Neither confirmation alone moves funds.
+
+Function | Parameters | Returns | Who | Behaviour
+--- | --- | --- | --- | ---
+`set_co_buyer(caller, shipment_id, co_buyer)` | `caller: Address`, `shipment_id: String`, `co_buyer: Address` | — | Registered buyer | Designates `co_buyer` for the shipment. Must be called before any amount is released or advanced. Immutable once set. Emits `co_buyer_set`.
+`get_co_buyer(shipment_id)` | `shipment_id: String` | `Option<Address>` | Anyone | Returns the designated co-buyer, or `None` if unset.
+`set_joint_confirmation_threshold(admin, threshold)` | `admin: Address`, `threshold: i128` | — | Admin | Sets the shipment-value threshold above which joint confirmation is required. `0` disables the feature entirely. Emits `joint_confirmation_threshold_set`.
+`get_joint_confirmation_threshold()` | — | `i128` | Anyone | Returns the current threshold. Default `0` (disabled).
+`get_joint_confirmation_status(shipment_id, milestone_index)` | `shipment_id: String`, `milestone_index: u32` | `JointConfirmationStatus` | Anyone | Returns `{ buyer_confirmed: bool, co_buyer_confirmed: bool }` for the milestone.
+
+**Default:** `0` — joint confirmation is disabled until an admin sets a positive threshold.
+
+**Usage example:**
+
+```bash
+# Admin enables joint confirmation for shipments over 10 000 USDC (stroops)
+stellar contract invoke --id $CONTRACT -- \
+  set_joint_confirmation_threshold --admin $ADMIN --threshold 1000000000
+
+# Buyer designates a co-buyer at shipment creation time
+stellar contract invoke --id $CONTRACT -- \
+  set_co_buyer --caller $BUYER --shipment_id "SHP-001" --co_buyer $CO_BUYER
+
+# Check confirmation progress for milestone 0
+stellar contract invoke --id $CONTRACT -- \
+  get_joint_confirmation_status --shipment_id "SHP-001" --milestone_index 0
+```
+
+---
+
+### Compliance Hold (#issue-487)
+
+An admin can freeze all state-changing operations on a single shipment pending an off-chain legal or compliance review. Only the held shipment is affected; all other shipments continue to operate normally.
+
+**Blocked operations while on hold:** milestone confirmation, proof submission, dispute opening, fund release, and any other write operation that calls `assert_shipment_not_on_hold` internally.
+
+**`reason_hash`:** a 32-byte hash of an off-chain document (e.g. an IPFS CID) that describes the hold reason. It is stored on-chain for auditability but the contract does not interpret its contents.
+
+Function | Parameters | Returns | Who | Behaviour
+--- | --- | --- | --- | ---
+`set_compliance_hold(admin, shipment_id, reason_hash)` | `admin: Address`, `shipment_id: String`, `reason_hash: BytesN<32>` | — | Admin | Places the shipment on compliance hold. Panics if the shipment does not exist. Emits `compliance_hold_set`.
+`clear_compliance_hold(admin, shipment_id)` | `admin: Address`, `shipment_id: String` | — | Admin | Lifts the compliance hold. Panics if the shipment is not currently on hold. Emits `compliance_hold_cleared`.
+`is_on_compliance_hold(shipment_id)` | `shipment_id: String` | `bool` | Anyone | Returns `true` if the shipment is currently on compliance hold.
+
+**Usage example:**
+
+```bash
+# Place a hold (reason_hash is a 32-byte hex-encoded IPFS CID digest)
+stellar contract invoke --id $CONTRACT -- \
+  set_compliance_hold \
+  --admin $ADMIN \
+  --shipment_id "SHP-002" \
+  --reason_hash "$(echo -n 'bafkreiabcdef...' | xxd -p -c 32)"
+
+# Query hold status
+stellar contract invoke --id $CONTRACT -- \
+  is_on_compliance_hold --shipment_id "SHP-002"
+
+# Lift the hold once the review is complete
+stellar contract invoke --id $CONTRACT -- \
+  clear_compliance_hold --admin $ADMIN --shipment_id "SHP-002"
+```
+
+---
+
+### Dispute Appeals (#369)
+
+Either party (buyer or supplier) may appeal a resolved dispute within an admin-configured ledger window. The appeal draws a new arbiter from the pool (excluding the original arbiter) and reopens the milestone as `Disputed` for a second resolution. That second resolution is final — each dispute may only be appealed once.
+
+**Appeal window:** measured in ledgers after the dispute is resolved. `0` disables appeals entirely.
+
+**Arbiter selection:** the replacement arbiter is drawn from the pool, preferring arbiters not recently assigned to the same supplier's disputes. If no distinct arbiter is available, the appeal panics.
+
+Function | Parameters | Returns | Who | Behaviour
+--- | --- | --- | --- | ---
+`appeal_dispute(caller, shipment_id, milestone_index)` | `caller: Address`, `shipment_id: String`, `milestone_index: u32` | — | Buyer or supplier | Opens an appeal. Panics if appeals are disabled, the window has closed, or the dispute was already appealed. Assigns a new arbiter and emits `dispute_appealed`.
+`set_appeal_window_ledgers(admin, ledgers)` | `admin: Address`, `ledgers: u32` | — | Admin | Sets the appeal window. `0` disables appeals. Emits `appeal_window_ledgers_set`.
+`get_appeal_window_ledgers()` | — | `u32` | Anyone | Returns the configured window in ledgers. Default `0` (disabled).
+`get_dispute_resolution_reason(shipment_id, milestone_index)` | `shipment_id: String`, `milestone_index: u32` | `Option<ResolutionReason>` | Anyone | Returns the reason recorded for the most recent resolution (`ProofValid`, `ProofInvalid`, `ProofLate`, `InsufficientEvidence`, or `MutualSettlement`), or `None` if unresolved.
+
+**Default:** `0` — appeals are disabled until an admin sets a positive window.
+
+**Usage example:**
+
+```bash
+# Enable a 500-ledger appeal window (~42 minutes on Stellar mainnet)
+stellar contract invoke --id $CONTRACT -- \
+  set_appeal_window_ledgers --admin $ADMIN --ledgers 500
+
+# After a dispute is resolved, either party may appeal
+stellar contract invoke --id $CONTRACT -- \
+  appeal_dispute --caller $BUYER --shipment_id "SHP-003" --milestone_index 1
+
+# Read the resolution reason for the (now re-opened) dispute
+stellar contract invoke --id $CONTRACT -- \
+  get_dispute_resolution_reason --shipment_id "SHP-003" --milestone_index 1
+```
+
+---
+
+### Arbiter Slashing & Reinstatement (#372)
+
+Arbiters whose resolutions are repeatedly overturned on appeal are automatically removed from the arbiter pool (slashed). An admin can later reinstate them in an explicit two-step process.
+
+**What counts as "overturned":** when `appeal_dispute` leads to a second resolution that contradicts the first arbiter's ruling, the original arbiter's overturned count is incremented. Once it reaches the configured threshold, `slash_arbiter` is called automatically.
+
+**Two-step reinstatement:**
+1. `reinstate_arbiter` — clears the slashed flag.
+2. `add_arbiter_to_pool` — re-adds the arbiter to the pool (called separately by an admin).
+
+Reinstatement does **not** automatically re-add the arbiter to the pool; both steps are required.
+
+Function | Parameters | Returns | Who | Behaviour
+--- | --- | --- | --- | ---
+`set_max_overturned_before_slash(admin, threshold)` | `admin: Address`, `threshold: u32` | — | Admin | Sets the overturned-resolution count that triggers auto-slashing. `0` disables auto-slashing. Emits `max_overturned_before_slash_set`.
+`get_max_overturned_before_slash()` | — | `u32` | Anyone | Returns the configured threshold. Default `0` (disabled).
+`is_arbiter_slashed(arbiter)` | `arbiter: Address` | `bool` | Anyone | Returns `true` if the arbiter is currently slashed.
+`reinstate_arbiter(admin, arbiter)` | `admin: Address`, `arbiter: Address` | — | Admin | Clears the slashed flag. Does **not** re-add the arbiter to the pool. Emits `arbiter_reinstated`.
+
+**Default:** `0` — auto-slashing is disabled until an admin sets a positive threshold.
+
+**Usage example:**
+
+```bash
+# Slash after 3 overturned resolutions
+stellar contract invoke --id $CONTRACT -- \
+  set_max_overturned_before_slash --admin $ADMIN --threshold 3
+
+# Check if an arbiter is slashed
+stellar contract invoke --id $CONTRACT -- \
+  is_arbiter_slashed --arbiter $ARBITER
+
+# Step 1 – clear the slashed flag
+stellar contract invoke --id $CONTRACT -- \
+  reinstate_arbiter --admin $ADMIN --arbiter $ARBITER
+
+# Step 2 – re-add to the pool (separate call)
+stellar contract invoke --id $CONTRACT -- \
+  add_arbiter_to_pool --admin $ADMIN --arbiter $ARBITER
+```
+
