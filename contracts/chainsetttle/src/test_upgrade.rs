@@ -104,6 +104,7 @@ fn make_shipment(
             inspected_milestones: vec![env],
             proof_submitters: vec![env],
             require_dual_attestation: false,
+            fund_from_vault: false,
         },
     );
 }
