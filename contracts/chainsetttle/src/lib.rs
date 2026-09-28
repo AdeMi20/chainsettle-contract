@@ -2642,6 +2642,38 @@ impl ChainSettleContract {
             .unwrap_or(0)
     }
 
+    /// Set the flat fee (in the shipment token) the appellant pays when calling
+    /// `appeal_dispute` (0 = no fee). The fee is refunded if the appeal succeeds
+    /// and paid to the appeal arbiter otherwise.
+    pub fn set_appeal_fee(env: Env, admin: Address, amount: i128) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        if amount < 0 {
+            panic!("appeal fee cannot be negative");
+        }
+        env.storage().instance().set(&DataKeyExt4::AppealFee, &amount);
+        env.events()
+            .publish((Symbol::new(&env, "appeal_fee_set"),), amount);
+    }
+
+    pub fn get_appeal_fee(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKeyExt4::AppealFee)
+            .unwrap_or(0)
+    }
+
+    /// Returns the escrowed appeal fee for a milestone as (appellant, amount), if any.
+    pub fn get_appeal_fee_deposit(
+        env: Env,
+        shipment_id: String,
+        milestone_index: u32,
+    ) -> Option<(Address, i128)> {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt4::AppealFeeDeposit(shipment_id, milestone_index))
+    }
+
     // ----------------------------------------------------------
     // ADMIN: RESOLUTION FINALITY DELAY (#393)
     // ----------------------------------------------------------
@@ -4662,6 +4694,7 @@ impl ChainSettleContract {
         keys.push_back(DataKeyExt2::DisputeAppealed(s.clone(), idx).into_val(env));
         keys.push_back(DataKeyExt2::MediationProposal(s.clone(), idx).into_val(env));
         keys.push_back(DataKeyExt2::DisputeAppealOriginal(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt4::AppealFeeDeposit(s.clone(), idx).into_val(env));
         keys.push_back(DataKeyExt2::DisputeResolvedApprove(s.clone(), idx).into_val(env));
         keys.push_back(DataKeyExt2::DisputeResolutionReason(s.clone(), idx).into_val(env));
         keys.push_back(DataKeyExt2::ExtensionRequestCount(s.clone(), idx).into_val(env));
@@ -5943,6 +5976,41 @@ impl ChainSettleContract {
     }
 
     // ----------------------------------------------------------
+    // ARBITER AVAILABILITY
+    // ----------------------------------------------------------
+
+    /// An arbiter marks themselves available or unavailable for new assignments.
+    /// Unavailable arbiters stay in the pool but are skipped by pool selection
+    /// (pool-arbiter disputes, appeals and panel assignment). Existing
+    /// assignments are unaffected.
+    pub fn set_arbiter_availability(env: Env, arbiter: Address, available: bool) {
+        arbiter.require_auth();
+        let key = DataKeyExt4::ArbiterUnavailable(arbiter.clone());
+        if available {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &true);
+            env.storage().persistent().extend_ttl(
+                &key,
+                constants::TTL_INITIAL_LEDGERS,
+                constants::TTL_MAX_LEDGERS,
+            );
+        }
+        env.events().publish(
+            (Symbol::new(&env, "arbiter_availability_set"), arbiter),
+            available,
+        );
+    }
+
+    /// Whether `arbiter` is currently accepting new assignments (default true).
+    pub fn is_arbiter_available(env: Env, arbiter: Address) -> bool {
+        !env.storage()
+            .persistent()
+            .get(&DataKeyExt4::ArbiterUnavailable(arbiter))
+            .unwrap_or(false)
+    }
+
+    // ----------------------------------------------------------
     // #470: ARBITER REPETITION GUARD
     // ----------------------------------------------------------
 
@@ -5977,7 +6045,8 @@ impl ChainSettleContract {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
-    /// Admin assigns an N-member arbiter panel, drawn from the pool, to a
+    /// Admin assigns an N-member arbiter panel, drawn pseudo-randomly (via
+    /// `env.prng()`) from the pool, to a
     /// shipment with an open dispute on `milestone_index`. Arbiters in the
     /// supplier's recent history are skipped when the pool allows it; otherwise
     /// the least-recently-used ones are reused. The shipment's buyers and
@@ -6018,7 +6087,10 @@ impl ChainSettleContract {
 
         let mut exclude = shipment.buyers.clone();
         exclude.push_back(shipment.supplier.clone());
-        let pool = Self::get_arbiter_pool(env.clone());
+        // Shuffle a copy of the pool with the host PRNG so panel membership is
+        // pseudo-random rather than always the first N arbiters in pool order.
+        let mut pool = Self::get_arbiter_pool(env.clone());
+        env.prng().shuffle(&mut pool);
         let picked = Self::select_pool_arbiters(
             &env,
             &shipment.supplier,
@@ -6057,6 +6129,7 @@ impl ChainSettleContract {
     /// if that cannot fill `count`, the remaining slots fall back to recent
     /// arbiters, least-recently-assigned first. With the guard disabled the
     /// result is simply the first eligible arbiters in round-robin order.
+    /// Arbiters who have marked themselves unavailable are never picked.
     fn select_pool_arbiters(
         env: &Env,
         supplier: &Address,
@@ -6083,7 +6156,10 @@ impl ChainSettleContract {
             }
             let idx = (start + step) % len;
             let candidate = pool.get(idx).unwrap();
-            if exclude.contains(&candidate) || recent.contains(&candidate) {
+            if exclude.contains(&candidate)
+                || recent.contains(&candidate)
+                || !Self::is_arbiter_available(env.clone(), candidate.clone())
+            {
                 continue;
             }
             picked.push_back(idx);
@@ -6095,7 +6171,9 @@ impl ChainSettleContract {
                 break;
             }
             let candidate = recent.get(r).unwrap();
-            if exclude.contains(&candidate) {
+            if exclude.contains(&candidate)
+                || !Self::is_arbiter_available(env.clone(), candidate.clone())
+            {
                 continue;
             }
             if let Some(idx) = pool.first_index_of(&candidate) {
@@ -9416,7 +9494,7 @@ impl ChainSettleContract {
                 &Vec::new(&env),
             )
             .get(0)
-            .unwrap_or(idx);
+            .unwrap_or_else(|| panic!("NoArbitersAvailable"));
             let next_idx = (chosen_idx + 1) % pool.len() as u32;
             let old_arbiter = shipment.arbiter.clone();
             shipment.arbiter = pool.get(chosen_idx).unwrap();
@@ -10134,6 +10212,9 @@ impl ChainSettleContract {
             &reason,
         );
 
+        // Appeal fee: refund if the appeal ruled for the appellant, else pay the appeal arbiter.
+        Self::settle_appeal_fee(&env, &shipment, &shipment_id, milestone_index, approve);
+
         // #372: If this resolution is the second (appeal) resolution of this
         // dispute cycle, compare it against the original arbiter's outcome —
         // a differing outcome means the original arbiter was overturned.
@@ -10569,6 +10650,25 @@ impl ChainSettleContract {
         shipment.open_dispute_count += 1;
         shipment.milestones.set(milestone_index, milestone);
 
+        // Escrow the appeal fee; settled when the appeal is resolved.
+        let appeal_fee = Self::get_appeal_fee(env.clone());
+        if appeal_fee > 0 {
+            token::Client::new(&env, &shipment.token).transfer(
+                &caller,
+                &env.current_contract_address(),
+                &appeal_fee,
+            );
+            let deposit_key = DataKeyExt4::AppealFeeDeposit(shipment_id.clone(), milestone_index);
+            env.storage()
+                .persistent()
+                .set(&deposit_key, &(caller.clone(), appeal_fee));
+            env.storage().persistent().extend_ttl(
+                &deposit_key,
+                constants::TTL_INITIAL_LEDGERS,
+                constants::TTL_MAX_LEDGERS,
+            );
+        }
+
         env.storage().persistent().set(&appealed_key, &true);
         env.storage().persistent().remove(&resolved_key);
 
@@ -10579,6 +10679,56 @@ impl ChainSettleContract {
         env.events().publish(
             (Symbol::new(&env, "dispute_appealed"), shipment_id),
             (milestone_index, caller, new_arbiter),
+        );
+    }
+
+    /// Settles an escrowed appeal fee once the appeal's resolution is known. The appeal
+    /// succeeds when it rules for the appellant (supplier → `approve`, buyer → `!approve`);
+    /// the fee is then refunded to the appellant. Otherwise it is paid to the arbiter who
+    /// heard the appeal. No-op when no fee was escrowed.
+    fn settle_appeal_fee(
+        env: &Env,
+        shipment: &Shipment,
+        shipment_id: &String,
+        milestone_index: u32,
+        approve: bool,
+    ) {
+        let key = DataKeyExt4::AppealFeeDeposit(shipment_id.clone(), milestone_index);
+        let (appellant, amount) = match env
+            .storage()
+            .persistent()
+            .get::<DataKeyExt4, (Address, i128)>(&key)
+        {
+            Some(d) => d,
+            None => return,
+        };
+        env.storage().persistent().remove(&key);
+
+        let appeal_succeeded = if appellant == shipment.supplier {
+            approve
+        } else {
+            !approve
+        };
+        let recipient = if appeal_succeeded {
+            appellant.clone()
+        } else {
+            shipment.arbiter.clone()
+        };
+        if amount > 0 {
+            token::Client::new(env, &shipment.token).transfer(
+                &env.current_contract_address(),
+                &recipient,
+                &amount,
+            );
+        }
+        let event = if appeal_succeeded {
+            "appeal_fee_refunded"
+        } else {
+            "appeal_fee_forfeited"
+        };
+        env.events().publish(
+            (Symbol::new(env, event), shipment_id.clone()),
+            (milestone_index, recipient, amount),
         );
     }
 
@@ -14248,6 +14398,7 @@ impl ChainSettleContract {
                 milestone_index,
                 majority_approve,
                 arbiter,
+                &votes,
             );
         }
     }
@@ -14260,6 +14411,7 @@ impl ChainSettleContract {
         milestone_index: u32,
         approve: bool,
         resolver: Address,
+        votes: &Vec<DisputeVote>,
     ) {
         let ctx = Self::fetch_resolve_dispute_ctx(env, &shipment_id, milestone_index);
         let mut shipment = ctx.shipment;
@@ -14297,30 +14449,14 @@ impl ChainSettleContract {
             Self::check_address_outflow(env, &shipment.supplier, payment);
 
             let fee_bps = Self::applicable_arbiter_fee_bps(env, payment, shipment.arbiter_fee_bps);
-            // For panel, fee is split equally among all panel members.
-            let panel: Vec<Address> = env
-                .storage()
-                .persistent()
-                .get(&DataKeyExt::ArbiterPanel(shipment_id.clone()))
-                .unwrap_or_else(|| Vec::new(env));
-            let arbiter_fee_total = (payment * fee_bps as i128) / 10_000;
-            if arbiter_fee_total > 0 && !panel.is_empty() {
-                let per_arbiter = arbiter_fee_total / panel.len() as i128;
-                let mut distributed: i128 = 0;
-                for i in 0..panel.len() {
-                    let p = panel.get(i).unwrap();
-                    let amount = if i == panel.len() - 1 {
-                        // Last arbiter gets remainder to avoid dust loss.
-                        arbiter_fee_total - distributed
-                    } else {
-                        per_arbiter
-                    };
-                    if amount > 0 {
-                        token_client.transfer(&env.current_contract_address(), &p, &amount);
-                        distributed += amount;
-                    }
-                }
-            }
+            let arbiter_fee_total = Self::distribute_panel_fee(
+                env,
+                &token_client,
+                &shipment_id,
+                milestone_index,
+                votes,
+                (payment * fee_bps as i128) / 10_000,
+            );
 
             shipment.released_amount += payment;
             let actual_transfer = (net_payment - advance_deducted - arbiter_fee_total).max(0);
@@ -14363,28 +14499,14 @@ impl ChainSettleContract {
             panel_outcome = Some(DisputeOutcome::Supplier);
         } else if is_partial {
             let fee_bps = Self::applicable_arbiter_fee_bps(env, payment, shipment.arbiter_fee_bps);
-            let panel: Vec<Address> = env
-                .storage()
-                .persistent()
-                .get(&DataKeyExt::ArbiterPanel(shipment_id.clone()))
-                .unwrap_or_else(|| Vec::new(env));
-            let arbiter_fee_total = (payment * fee_bps as i128) / 10_000;
-            if arbiter_fee_total > 0 && !panel.is_empty() {
-                let per_arbiter = arbiter_fee_total / panel.len() as i128;
-                let mut distributed: i128 = 0;
-                for i in 0..panel.len() {
-                    let p = panel.get(i).unwrap();
-                    let amount = if i == panel.len() - 1 {
-                        arbiter_fee_total - distributed
-                    } else {
-                        per_arbiter
-                    };
-                    if amount > 0 {
-                        token_client.transfer(&env.current_contract_address(), &p, &amount);
-                        distributed += amount;
-                    }
-                }
-            }
+            let arbiter_fee_total = Self::distribute_panel_fee(
+                env,
+                &token_client,
+                &shipment_id,
+                milestone_index,
+                votes,
+                (payment * fee_bps as i128) / 10_000,
+            );
             let buyer_refund = (payment - arbiter_fee_total).max(0);
             if buyer_refund > 0 {
                 let primary_buyer = shipment.buyers.get(0).unwrap();
@@ -14540,6 +14662,42 @@ impl ChainSettleContract {
             &resolver,
             None,
         );
+    }
+
+    /// Splits a panel dispute's arbiter fee equally among the panel members who actually
+    /// voted (non-voters earn nothing). The last voter receives the rounding remainder so
+    /// no dust is left behind. Returns the amount paid out (0 when there were no voters).
+    fn distribute_panel_fee(
+        env: &Env,
+        token_client: &token::Client,
+        shipment_id: &String,
+        milestone_index: u32,
+        votes: &Vec<DisputeVote>,
+        fee_total: i128,
+    ) -> i128 {
+        let voters = votes.len();
+        if fee_total <= 0 || voters == 0 {
+            return 0;
+        }
+        let per_voter = fee_total / voters as i128;
+        let mut distributed: i128 = 0;
+        for i in 0..voters {
+            let voter = votes.get(i).unwrap().arbiter;
+            let amount = if i == voters - 1 {
+                fee_total - distributed
+            } else {
+                per_voter
+            };
+            if amount > 0 {
+                token_client.transfer(&env.current_contract_address(), &voter, &amount);
+                distributed += amount;
+            }
+        }
+        env.events().publish(
+            (Symbol::new(env, "panel_fee_distributed"), shipment_id.clone()),
+            (milestone_index, voters, distributed),
+        );
+        distributed
     }
 
     /// Returns the current votes for a panel dispute identified by shipment and milestone.
