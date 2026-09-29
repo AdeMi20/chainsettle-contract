@@ -174,3 +174,94 @@ fn test_top_up_rejects_non_positive_amount() {
 
     client.top_up_escrow(&t.buyer, &ship_id, &0);
 }
+
+#[test]
+#[should_panic(expected = "additional_amount must be greater than zero")]
+fn test_top_up_rejects_negative_amount() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let ship_id = sid(&t.env, "ship1");
+    create_standard_shipment(
+        &client, &t.env, &ship_id, &t.buyer, &t.supplier, &t.logistics, &t.arbiter,
+        &t.token_id, 1_000_000,
+    );
+
+    client.top_up_escrow(&t.buyer, &ship_id, &-100);
+}
+
+#[test]
+#[should_panic(expected = "shipment not found")]
+fn test_top_up_rejected_for_unknown_shipment() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+
+    client.top_up_escrow(&t.buyer, &sid(&t.env, "missing"), &500_000);
+}
+
+#[test]
+#[should_panic(expected = "contract is paused")]
+fn test_top_up_rejected_when_contract_paused() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let ship_id = sid(&t.env, "ship1");
+    create_standard_shipment(
+        &client, &t.env, &ship_id, &t.buyer, &t.supplier, &t.logistics, &t.arbiter,
+        &t.token_id, 1_000_000,
+    );
+
+    // `setup` initialises the contract with the buyer as admin.
+    client.pause(&t.buyer);
+    client.top_up_escrow(&t.buyer, &ship_id, &500_000);
+}
+
+#[test]
+fn test_top_up_transfers_tokens_from_buyer_to_contract() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let token = soroban_sdk::token::Client::new(&t.env, &t.token_id);
+    let ship_id = sid(&t.env, "ship1");
+    create_standard_shipment(
+        &client, &t.env, &ship_id, &t.buyer, &t.supplier, &t.logistics, &t.arbiter,
+        &t.token_id, 1_000_000,
+    );
+
+    let buyer_before = token.balance(&t.buyer);
+    let contract_before = token.balance(&t.contract_id);
+
+    client.top_up_escrow(&t.buyer, &ship_id, &250_000);
+
+    assert_eq!(token.balance(&t.buyer), buyer_before - 250_000);
+    assert_eq!(token.balance(&t.contract_id), contract_before + 250_000);
+}
+
+#[test]
+#[should_panic(expected = "SupplierExposureCapExceeded")]
+fn test_top_up_rejected_when_exceeding_supplier_exposure_cap() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let ship_id = sid(&t.env, "ship1");
+    client.set_supplier_exposure_cap(&t.buyer, &1_200_000);
+    create_standard_shipment(
+        &client, &t.env, &ship_id, &t.buyer, &t.supplier, &t.logistics, &t.arbiter,
+        &t.token_id, 1_000_000,
+    );
+
+    client.top_up_escrow(&t.buyer, &ship_id, &200_001);
+}
+
+#[test]
+fn test_top_up_allowed_up_to_supplier_exposure_cap() {
+    let t = setup();
+    let client = ChainSettleContractClient::new(&t.env, &t.contract_id);
+    let ship_id = sid(&t.env, "ship1");
+    client.set_supplier_exposure_cap(&t.buyer, &1_200_000);
+    create_standard_shipment(
+        &client, &t.env, &ship_id, &t.buyer, &t.supplier, &t.logistics, &t.arbiter,
+        &t.token_id, 1_000_000,
+    );
+
+    client.top_up_escrow(&t.buyer, &ship_id, &200_000);
+
+    assert_eq!(client.get_shipment(&ship_id).total_amount, 1_200_000);
+    assert_eq!(client.get_supplier_exposure(&t.supplier), 1_200_000);
+}
