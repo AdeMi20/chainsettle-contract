@@ -841,6 +841,24 @@ milestone, or `0` when no deadline has been set.
 Extension request, approval, and denial calls are paused by the emergency
 circuit breaker; `get_milestone_deadline` remains available while paused.
 
+Mutual Shipment Expiry Extension
+Buyer and supplier can jointly extend a shipment's `expires_at_ledger` when legitimate delays occur. The flow requires mutual consent: one party proposes a new expiry ledger, and the other party must approve it before the change takes effect.
+`set_max_expiry_extension_ledgers(admin, ledgers)` — admin only. Sets the maximum total number of ledgers a shipment's expiry may be extended by across all approved extensions. `0` (the default) means unlimited. Emits `max_expiry_ext_set`.
+`get_max_expiry_extension_ledgers() → u32` (read-only) — returns the configured ceiling.
+`propose_expiry_extension(caller, shipment_id, new_expiry_ledger)` — buyer or supplier. Proposes moving the shipment's expiry to `new_expiry_ledger`. The shipment must be `Active`, have an existing expiry, not be expired yet, and the new expiry must be later than the current one. The proposal is stored and emits `expiry_extension_proposed`.
+`approve_expiry_extension(counterparty, shipment_id)` — the other party. Approves the pending proposal, moves `expires_at_ledger` to the requested ledger, records the cumulative extension against the admin ceiling, clears the proposal, and emits `expiry_extended` with the old and new expiry ledgers. Re-validates all preconditions (shipment still active, not expired, cumulative extension within ceiling, proposal not stale).
+`get_pending_expiry_extension(shipment_id) → Option<ExpiryExtensionProposal>` (read-only) — returns the pending proposal with proposer, requested expiry, and base expiry.
+`get_total_expiry_extended(shipment_id) → u32` (read-only) — returns the cumulative ledgers the shipment's expiry has been extended by so far.
+Rules:
+- Only the buyer or supplier may propose; the counterparty must approve (a party cannot approve its own proposal).
+- The shipment must have an `expires_at_ledger` set at creation; shipments without expiry cannot use this feature.
+- An expired shipment cannot be extended (checked against current ledger at both propose and approve time).
+- Extensions are cumulative: the admin ceiling applies to the sum of all deltas across the shipment's lifetime.
+- A cancelled or completed shipment cannot be extended.
+- A paused contract or paused shipment blocks proposal and approval calls.
+- Events: `expiry_extension_proposed(proposer, current_expiry, new_expiry)` and `expiry_extended(old_expiry, new_expiry, approver)`.
+- Audit log: `expiry_ext_proposed` on proposal, `expiry_extended` on approval.
+
 Milestone Amendment History Tracking
 Buyer and supplier can mutually agree to change a **Pending** milestone's payment percentage and/or name after a shipment is created — for example, to fix a typo in the milestone name or rebalance value between milestones before any proof is submitted. Changes only take effect once **both parties agree on the exact same terms**.
 
@@ -2515,148 +2533,73 @@ Function | Who | Behaviour
 `rate_counterparty(caller, shipment_id, stars, comment_hash)` | Buyer or supplier | One rating per party per shipment. Emits `counterparty_rated` and writes an audit entry.
 `get_rating_summary(address)` | Anyone (read-only) | `(count, average_x100)`. `(0, 0)` if never rated.
 
-### Co-Buyer Joint Confirmation (#367)
 
-High-value shipments can require both the buyer and a designated co-buyer to confirm a milestone before funds are released. The threshold is admin-controlled; shipments at or below the threshold use the normal single-buyer confirmation flow.
+### Emergency Freeze / Unfreeze Governance (#402)
 
-**How it works:** The buyer designates a co-buyer once, before the shipment progresses. When the shipment value exceeds the configured threshold, `confirm_milestone` requires both the buyer and the co-buyer to call it independently. Neither confirmation alone moves funds.
+The emergency freeze is a stricter kill switch than `pause()`/`unpause()`, and it is stored separately. While it is active, every call guarded by the pause check panics with `contract is under emergency freeze`. Calling `unpause()` does **not** lift it.
 
-Function | Parameters | Returns | Who | Behaviour
---- | --- | --- | --- | ---
-`set_co_buyer(caller, shipment_id, co_buyer)` | `caller: Address`, `shipment_id: String`, `co_buyer: Address` | — | Registered buyer | Designates `co_buyer` for the shipment. Must be called before any amount is released or advanced. Immutable once set. Emits `co_buyer_set`.
-`get_co_buyer(shipment_id)` | `shipment_id: String` | `Option<Address>` | Anyone | Returns the designated co-buyer, or `None` if unset.
-`set_joint_confirmation_threshold(admin, threshold)` | `admin: Address`, `threshold: i128` | — | Admin | Sets the shipment-value threshold above which joint confirmation is required. `0` disables the feature entirely. Emits `joint_confirmation_threshold_set`.
-`get_joint_confirmation_threshold()` | — | `i128` | Anyone | Returns the current threshold. Default `0` (disabled).
-`get_joint_confirmation_status(shipment_id, milestone_index)` | `shipment_id: String`, `milestone_index: u32` | `JointConfirmationStatus` | Anyone | Returns `{ buyer_confirmed: bool, co_buyer_confirmed: bool }` for the milestone.
+How a freeze is activated or lifted depends on whether multisig admin governance (`initialize_multisig_admin`, #166) is configured:
 
-**Default:** `0` — joint confirmation is disabled until an admin sets a positive threshold.
+- **No multisig configured:** a single admin's `propose_emergency_freeze` / `propose_emergency_unfreeze` takes effect immediately and returns `0`.
+- **Multisig configured:** a registered admin opens a proposal and the proposer's approval counts as the first vote. The action executes automatically when the number of distinct approvals reaches the **supermajority** of registered admins. This bar is higher than the routine `MultiAdminConfig.threshold`. Required approvals = `ceil(admins × bps / 10000)`, with a minimum of 1. With the default 8000 bps (80%) and 5 admins, 4 approvals are needed.
 
-**Usage example:**
+Function | Who | Behaviour
+--- | --- | ---
+`set_freeze_supermajority_bps(admin, bps)` | Admin | Sets the supermajority. `bps` must be in `(0, 10000]`. Emits `freeze_supermajority_bps_set`.
+`get_freeze_supermajority_bps()` | Anyone (read-only) | Configured value, default `8000`.
+`is_emergency_frozen()` | Anyone (read-only) | `true` while the freeze is active.
+`propose_emergency_freeze(admin) → u64` | Admin / multisig admin | Opens a freeze proposal and returns its id. If one approval already meets the supermajority, the freeze activates immediately. Emits `emergency_freeze_proposed`.
+`approve_emergency_freeze(admin, proposal_id)` | Multisig admin | Adds an approval. Panics on a duplicate approval or an unknown or already-executed proposal. Emits `emergency_freeze_approved` `(admin, approvals_count)`.
+`propose_emergency_unfreeze(admin) → u64` | Admin / multisig admin | Same flow as freezing, for lifting the freeze. Emits `emergency_unfreeze_proposed`.
+`approve_emergency_unfreeze(admin, proposal_id)` | Multisig admin | Same rules as `approve_emergency_freeze`. Emits `emergency_unfreeze_approved`.
+`get_emergency_freeze_proposal(id)` / `get_emergency_unfreeze_proposal(id)` | Anyone (read-only) | The pending `EmergencyFreezeProposal { approvals }`, or `None` once it has executed or if it never existed.
 
-```bash
-# Admin enables joint confirmation for shipments over 10 000 USDC (stroops)
-stellar contract invoke --id $CONTRACT -- \
-  set_joint_confirmation_threshold --admin $ADMIN --threshold 1000000000
-
-# Buyer designates a co-buyer at shipment creation time
-stellar contract invoke --id $CONTRACT -- \
-  set_co_buyer --caller $BUYER --shipment_id "SHP-001" --co_buyer $CO_BUYER
-
-# Check confirmation progress for milestone 0
-stellar contract invoke --id $CONTRACT -- \
-  get_joint_confirmation_status --shipment_id "SHP-001" --milestone_index 0
-```
-
----
-
-### Compliance Hold (#issue-487)
-
-An admin can freeze all state-changing operations on a single shipment pending an off-chain legal or compliance review. Only the held shipment is affected; all other shipments continue to operate normally.
-
-**Blocked operations while on hold:** milestone confirmation, proof submission, dispute opening, fund release, and any other write operation that calls `assert_shipment_not_on_hold` internally.
-
-**`reason_hash`:** a 32-byte hash of an off-chain document (e.g. an IPFS CID) that describes the hold reason. It is stored on-chain for auditability but the contract does not interpret its contents.
-
-Function | Parameters | Returns | Who | Behaviour
---- | --- | --- | --- | ---
-`set_compliance_hold(admin, shipment_id, reason_hash)` | `admin: Address`, `shipment_id: String`, `reason_hash: BytesN<32>` | — | Admin | Places the shipment on compliance hold. Panics if the shipment does not exist. Emits `compliance_hold_set`.
-`clear_compliance_hold(admin, shipment_id)` | `admin: Address`, `shipment_id: String` | — | Admin | Lifts the compliance hold. Panics if the shipment is not currently on hold. Emits `compliance_hold_cleared`.
-`is_on_compliance_hold(shipment_id)` | `shipment_id: String` | `bool` | Anyone | Returns `true` if the shipment is currently on compliance hold.
-
-**Usage example:**
+When the threshold is met, the proposal is deleted and `emergency_freeze_activated` or `emergency_freeze_lifted` is emitted. Freeze and unfreeze proposals share one id counter, so ids are unique across both kinds.
 
 ```bash
-# Place a hold (reason_hash is a 32-byte hex-encoded IPFS CID digest)
-stellar contract invoke --id $CONTRACT -- \
-  set_compliance_hold \
-  --admin $ADMIN \
-  --shipment_id "SHP-002" \
-  --reason_hash "$(echo -n 'bafkreiabcdef...' | xxd -p -c 32)"
+# 5 registered multisig admins, default 80% → 4 approvals required
+stellar contract invoke --id $CONTRACT_ID --source admin1 --network testnet \
+  -- propose_emergency_freeze --admin $ADMIN1          # → 1 (1/4 approvals)
 
-# Query hold status
-stellar contract invoke --id $CONTRACT -- \
-  is_on_compliance_hold --shipment_id "SHP-002"
+stellar contract invoke --id $CONTRACT_ID --source admin2 --network testnet \
+  -- approve_emergency_freeze --admin $ADMIN2 --proposal_id 1   # 2/4
+# ... admin3 and admin4 approve → freeze activates
 
-# Lift the hold once the review is complete
-stellar contract invoke --id $CONTRACT -- \
-  clear_compliance_hold --admin $ADMIN --shipment_id "SHP-002"
+stellar contract invoke --id $CONTRACT_ID --network testnet -- is_emergency_frozen   # → true
 ```
 
----
+### Milestone Templates (#365)
 
-### Dispute Appeals (#369)
+Buyers can save a named milestone set once and reuse it for new shipments. Templates are namespaced by creator address, so two creators can use the same name without colliding.
 
-Either party (buyer or supplier) may appeal a resolved dispute within an admin-configured ledger window. The appeal draws a new arbiter from the pool (excluding the original arbiter) and reopens the milestone as `Disputed` for a second resolution. That second resolution is final — each dispute may only be appealed once.
+Function | Who | Behaviour
+--- | --- | ---
+`save_milestone_template(creator, name, milestones)` | Creator | Validates the milestones the same way `create_shipment` does: not empty (`EmptyMilestoneTemplate`), no more than the max milestone count (`TooManyMilestones`), every `payment_percent` at least the minimum milestone percent (`InvalidPercentages`), and percentages summing to 100. Runtime state is reset: status becomes `Pending`, and the proof hash, release ledger and proof/dispute ledgers are cleared. Saving under an existing name overwrites that template. Blocked while the contract is paused or frozen. Emits `milestone_template_saved` `(creator, name)`.
+`list_milestone_templates(creator) → Vec<String>` | Anyone (read-only) | Names saved by `creator`, in the order they were first saved.
+`get_milestone_template(creator, name) → Vec<Milestone>` | Anyone (read-only) | The saved milestones. Panics with `TemplateNotFound` if none exists.
+`create_shipment_from_template(shipment_id, buyers, supplier, logistics, arbiter, token, total_amount, template_name, options)` | Primary buyer | Looks up `template_name` under `buyers[0]` and calls `create_shipment` with those milestones. All the usual `create_shipment` auth and validation still apply. Panics with `TemplateNotFound` if the primary buyer has no template with that name.
 
-**Appeal window:** measured in ledgers after the dispute is resolved. `0` disables appeals entirely.
+Templates are copied into a shipment when it is created. Changing a template later does not affect shipments that already exist. There is currently no function to delete a template.
 
-**Arbiter selection:** the replacement arbiter is drawn from the pool, preferring arbiters not recently assigned to the same supplier's disputes. If no distinct arbiter is available, the appeal panics.
+### Supplier Tiering (#397, #478)
 
-Function | Parameters | Returns | Who | Behaviour
---- | --- | --- | --- | ---
-`appeal_dispute(caller, shipment_id, milestone_index)` | `caller: Address`, `shipment_id: String`, `milestone_index: u32` | — | Buyer or supplier | Opens an appeal. Panics if appeals are disabled, the window has closed, or the dispute was already appealed. Assigns a new arbiter and emits `dispute_appealed`.
-`set_appeal_window_ledgers(admin, ledgers)` | `admin: Address`, `ledgers: u32` | — | Admin | Sets the appeal window. `0` disables appeals. Emits `appeal_window_ledgers_set`.
-`get_appeal_window_ledgers()` | — | `u32` | Anyone | Returns the configured window in ledgers. Default `0` (disabled).
-`get_dispute_resolution_reason(shipment_id, milestone_index)` | `shipment_id: String`, `milestone_index: u32` | `Option<ResolutionReason>` | Anyone | Returns the reason recorded for the most recent resolution (`ProofValid`, `ProofInvalid`, `ProofLate`, `InsufficientEvidence`, or `MutualSettlement`), or `None` if unresolved.
+Suppliers are ranked **Bronze**, **Silver** or **Gold** based on their reputation score (`completed` and `disputed` counts). A higher tier lowers the supplier's required collateral and, if #560 is configured, raises their maximum shipment value (see [Tier-based Maximum Shipment Value](#tier-based-maximum-shipment-value-560)).
 
-**Default:** `0` — appeals are disabled until an admin sets a positive window.
+`SupplierTierConfig`:
 
-**Usage example:**
+| Field | Meaning |
+| --- | --- |
+| `silver_min_completed` / `gold_min_completed` | Minimum completed shipments needed for the tier |
+| `silver_max_disputed_ratio_bps` / `gold_max_disputed_ratio_bps` | Maximum `disputed × 10000 / completed` allowed for the tier |
+| `silver_multiplier_bps` / `gold_multiplier_bps` | Collateral multiplier for the tier, `≤ 10000`. Tiers can only reduce collateral (e.g. `7500` = 25% off) |
+| `bronze_max_value` / `silver_max_value` / `gold_max_value` | Per-tier shipment value cap (#560). `0` = unlimited and must not be negative |
 
-```bash
-# Enable a 500-ledger appeal window (~42 minutes on Stellar mainnet)
-stellar contract invoke --id $CONTRACT -- \
-  set_appeal_window_ledgers --admin $ADMIN --ledgers 500
+**Tier derivation.** Gold is checked first, then Silver. A supplier gets a tier only if they meet both its completed-count minimum and its dispute-ratio maximum. A supplier with no completed shipments is Bronze, and so is every supplier while no config is set. Bronze always pays the full base collateral.
 
-# After a dispute is resolved, either party may appeal
-stellar contract invoke --id $CONTRACT -- \
-  appeal_dispute --caller $BUYER --shipment_id "SHP-003" --milestone_index 1
+Function | Who | Behaviour
+--- | --- | ---
+`set_supplier_tier_config(admin, config)` | Admin | Stores the config. Panics if a multiplier is above `10000` or a max value is negative. Emits `supplier_tier_config_set`.
+`get_supplier_tier_config() → Option<SupplierTierConfig>` | Anyone (read-only) | `None` until configured.
+`get_supplier_tier(supplier) → SupplierTier` | Anyone (read-only) | The supplier's tier, computed from their current reputation.
 
-# Read the resolution reason for the (now re-opened) dispute
-stellar contract invoke --id $CONTRACT -- \
-  get_dispute_resolution_reason --shipment_id "SHP-003" --milestone_index 1
-```
-
----
-
-### Arbiter Slashing & Reinstatement (#372)
-
-Arbiters whose resolutions are repeatedly overturned on appeal are automatically removed from the arbiter pool (slashed). An admin can later reinstate them in an explicit two-step process.
-
-**What counts as "overturned":** when `appeal_dispute` leads to a second resolution that contradicts the first arbiter's ruling, the original arbiter's overturned count is incremented. Once it reaches the configured threshold, `slash_arbiter` is called automatically.
-
-**Two-step reinstatement:**
-1. `reinstate_arbiter` — clears the slashed flag.
-2. `add_arbiter_to_pool` — re-adds the arbiter to the pool (called separately by an admin).
-
-Reinstatement does **not** automatically re-add the arbiter to the pool; both steps are required.
-
-Function | Parameters | Returns | Who | Behaviour
---- | --- | --- | --- | ---
-`set_max_overturned_before_slash(admin, threshold)` | `admin: Address`, `threshold: u32` | — | Admin | Sets the overturned-resolution count that triggers auto-slashing. `0` disables auto-slashing. Emits `max_overturned_before_slash_set`.
-`get_max_overturned_before_slash()` | — | `u32` | Anyone | Returns the configured threshold. Default `0` (disabled).
-`is_arbiter_slashed(arbiter)` | `arbiter: Address` | `bool` | Anyone | Returns `true` if the arbiter is currently slashed.
-`reinstate_arbiter(admin, arbiter)` | `admin: Address`, `arbiter: Address` | — | Admin | Clears the slashed flag. Does **not** re-add the arbiter to the pool. Emits `arbiter_reinstated`.
-
-**Default:** `0` — auto-slashing is disabled until an admin sets a positive threshold.
-
-**Usage example:**
-
-```bash
-# Slash after 3 overturned resolutions
-stellar contract invoke --id $CONTRACT -- \
-  set_max_overturned_before_slash --admin $ADMIN --threshold 3
-
-# Check if an arbiter is slashed
-stellar contract invoke --id $CONTRACT -- \
-  is_arbiter_slashed --arbiter $ARBITER
-
-# Step 1 – clear the slashed flag
-stellar contract invoke --id $CONTRACT -- \
-  reinstate_arbiter --admin $ADMIN --arbiter $ARBITER
-
-# Step 2 – re-add to the pool (separate call)
-stellar contract invoke --id $CONTRACT -- \
-  add_arbiter_to_pool --admin $ADMIN --arbiter $ARBITER
-```
-
+**Tier-change events (#478).** Whenever a supplier's reputation is updated, or their tier collateral discount is calculated at shipment creation, the tier is recomputed and compared with the last recorded tier (Bronze if none was recorded). If it has changed, the new tier is stored and `supplier_tier_changed` `(supplier, old_tier, new_tier)` is emitted. Calling `get_supplier_tier` never emits events and never updates the stored tier.
