@@ -103,6 +103,7 @@ pub enum CancellationReason {
     SupplierCancelled,
     DeadlineRefund,
     AdminEmergencyRecovery,
+    BlacklistedSupplier,
 }
 
 /// Default resolution applied when a dispute auto-resolves after timeout (#165).
@@ -467,6 +468,17 @@ pub struct ShipmentOptions {
     /// When true, `create_shipment` debits the primary buyer's vault balance
     /// instead of transferring tokens. Refunds return to the vault.
     pub fund_from_vault: bool,
+
+    // ── #551 Multi-supplier consortium ───────────────────────────────────────
+    /// Per-milestone supplier addresses (one per milestone). When non-empty and
+    /// length matches milestones, each milestone pays its own supplier and only
+    /// that supplier may submit proof for it. Empty = single-supplier (default).
+    pub milestone_suppliers: Vec<Address>,
+
+    // ── #553 Configurable refund recipient ───────────────────────────────────
+    /// Alternative address to receive refunds in place of the buyer.
+    /// None = refunds go to the buyer (default unchanged behaviour).
+    pub refund_recipient: Option<Address>,
 }
 
 /// #545 – Pending dual-attestation proof awaiting the second party.
@@ -3242,16 +3254,22 @@ impl ChainSettleContract {
             return;
         }
         let primary_buyer = shipment.buyers.get(0).unwrap();
+        // #553: Use the buyer-configured refund recipient when set.
+        let recipient: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt4::RefundRecipient(shipment_id.clone()))
+            .unwrap_or_else(|| primary_buyer.clone());
         let from_vault: bool = env
             .storage()
             .persistent()
             .get(&DataKeyExt4::FundFromVault(shipment_id.clone()))
             .unwrap_or(false);
         if from_vault {
-            Self::credit_vault(env, &primary_buyer, &shipment.token, amount);
+            Self::credit_vault(env, &recipient, &shipment.token, amount);
         } else {
             let token_client = token::Client::new(env, &shipment.token);
-            token_client.transfer(&env.current_contract_address(), &primary_buyer, &amount);
+            token_client.transfer(&env.current_contract_address(), &recipient, &amount);
         }
     }
 
@@ -3559,6 +3577,8 @@ impl ChainSettleContract {
             proof_submitters: Vec::new(env),
             require_dual_attestation: false,
             fund_from_vault: false,
+            milestone_suppliers: Vec::new(env),
+            refund_recipient: None,
         }
     }
 
@@ -3784,6 +3804,230 @@ impl ChainSettleContract {
             .persistent()
             .get(&DataKey::SupplierCollateral(shipment_id))
             .unwrap_or(0)
+    }
+
+    // ----------------------------------------------------------
+    // #556 SUPPLIER COLLATERAL TOP-UP
+    // ----------------------------------------------------------
+
+    /// Let the supplier add collateral to an active shipment.
+    /// Transfers `amount` tokens from the supplier and adds them to the stored collateral.
+    pub fn top_up_collateral(env: Env, supplier: Address, shipment_id: String, amount: i128) {
+        env.storage()
+            .instance()
+            .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
+        Self::assert_not_paused(&env);
+        supplier.require_auth();
+
+        if amount <= 0 {
+            panic!("amount must be greater than zero");
+        }
+
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+
+        if shipment.supplier != supplier {
+            panic!("unauthorized: only the supplier can top up collateral");
+        }
+        if shipment.status != ShipmentStatus::Active {
+            panic!("top-up only allowed on active shipments");
+        }
+
+        let token_client = token::Client::new(&env, &shipment.token);
+        token_client.transfer(&supplier, &env.current_contract_address(), &amount);
+
+        let collateral_key = DataKey::SupplierCollateral(shipment_id.clone());
+        let current: i128 = env
+            .storage()
+            .persistent()
+            .get(&collateral_key)
+            .unwrap_or(0);
+        let new_balance = current + amount;
+        env.storage()
+            .persistent()
+            .set(&collateral_key, &new_balance);
+        env.storage().persistent().extend_ttl(
+            &collateral_key,
+            constants::TTL_INITIAL_LEDGERS,
+            constants::TTL_MAX_LEDGERS,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "collateral_topped_up"), shipment_id),
+            (supplier, amount, new_balance),
+        );
+    }
+
+    // ----------------------------------------------------------
+    // #553 CONFIGURABLE REFUND RECIPIENT
+    // ----------------------------------------------------------
+
+    /// Let the buyer set an alternative address to receive refunds for a shipment.
+    /// Pass `None` to revert to the default (refunds go to the buyer).
+    pub fn set_refund_recipient(
+        env: Env,
+        buyer: Address,
+        shipment_id: String,
+        recipient: Option<Address>,
+    ) {
+        env.storage()
+            .instance()
+            .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
+        Self::assert_not_paused(&env);
+        buyer.require_auth();
+
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+        Self::assert_is_buyer(&shipment, &buyer);
+
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+
+        let key = DataKeyExt4::RefundRecipient(shipment_id.clone());
+        match recipient {
+            Some(ref addr) => {
+                let blacklisted = env
+                    .storage()
+                    .instance()
+                    .get::<DataKey, soroban_sdk::BytesN<32>>(&DataKey::Blacklisted(addr.clone()))
+                    .is_some();
+                if blacklisted {
+                    panic!("recipient is blacklisted");
+                }
+                env.storage().persistent().set(&key, addr);
+                env.storage().persistent().extend_ttl(
+                    &key,
+                    constants::TTL_INITIAL_LEDGERS,
+                    constants::TTL_MAX_LEDGERS,
+                );
+            }
+            None => {
+                env.storage().persistent().remove(&key);
+            }
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "refund_recipient_set"), shipment_id),
+            (buyer, recipient),
+        );
+    }
+
+    /// Return the configured refund recipient for a shipment, or None if not set.
+    pub fn get_refund_recipient(env: Env, shipment_id: String) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt4::RefundRecipient(shipment_id))
+    }
+
+    // ----------------------------------------------------------
+    // #554 CANCEL FOR BLACKLISTED SUPPLIER
+    // ----------------------------------------------------------
+
+    /// Cancel a shipment and get a full refund when the supplier is currently blacklisted.
+    /// No cancellation fee is charged; all supplier collateral is forfeited to the buyer.
+    pub fn cancel_for_blacklisted_supplier(env: Env, buyer: Address, shipment_id: String) {
+        env.storage()
+            .instance()
+            .extend_ttl(constants::TTL_INITIAL_LEDGERS, constants::TTL_MAX_LEDGERS);
+        Self::assert_not_paused(&env);
+        buyer.require_auth();
+
+        let mut shipment = Self::get_shipment_internal(&env, &shipment_id);
+
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        Self::assert_is_buyer(&shipment, &buyer);
+        Self::assert_shipment_not_on_hold(&env, &shipment_id);
+
+        let is_blacklisted = env
+            .storage()
+            .instance()
+            .get::<DataKey, soroban_sdk::BytesN<32>>(&DataKey::Blacklisted(
+                shipment.supplier.clone(),
+            ))
+            .is_some();
+        if !is_blacklisted {
+            panic!("supplier is not blacklisted");
+        }
+
+        let unreleased =
+            shipment.total_amount - shipment.released_amount - shipment.total_advanced_amount;
+
+        // No cancellation fee — refund all unreleased escrow.
+        if unreleased > 0 {
+            Self::refund_to_buyer(&env, &shipment_id, &shipment, unreleased);
+        }
+
+        // Forfeit collateral to buyer.
+        let collateral: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SupplierCollateral(shipment_id.clone()))
+            .unwrap_or(0);
+        if collateral > 0 {
+            Self::refund_to_buyer(&env, &shipment_id, &shipment, collateral);
+        }
+
+        Self::refund_holdbacks_on_cancel(&env, &shipment_id, &mut shipment, buyer.clone());
+
+        shipment.status = ShipmentStatus::Cancelled;
+        shipment.cancellation_reason =
+            Vec::from_array(&env, [CancellationReason::BlacklistedSupplier]);
+
+        Self::append_audit_entry(
+            &env,
+            &mut shipment,
+            buyer.clone(),
+            Symbol::new(&env, "shipment_cancelled"),
+            Symbol::new(&env, "cancel_blacklisted"),
+        );
+
+        Self::move_shipment_status_index(
+            &env,
+            ShipmentStatus::Active,
+            ShipmentStatus::Cancelled,
+            &shipment_id,
+        );
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Shipment(shipment_id.clone()), &shipment);
+
+        let current_escrowed: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalEscrowed(shipment.token.clone()))
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::TotalEscrowed(shipment.token.clone()),
+            &(current_escrowed - unreleased).max(0),
+        );
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "shipment_cancelled"),
+                shipment_id.clone(),
+            ),
+            (unreleased, 0i128, buyer.clone(), env.ledger().sequence()),
+        );
+        Self::emit_shipment_cancelled(
+            &env,
+            &shipment_id,
+            unreleased,
+            CancellationReason::BlacklistedSupplier,
+        );
+    }
+
+    // ----------------------------------------------------------
+    // #551 CONSORTIUM QUERY
+    // ----------------------------------------------------------
+
+    /// Returns true when this shipment was created with per-milestone consortium suppliers.
+    pub fn is_consortium_shipment(env: Env, shipment_id: String) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt4::IsConsortium(shipment_id))
+            .unwrap_or(false)
     }
 
     /// Releases the proportional collateral share for a milestone that has just
@@ -6348,6 +6592,8 @@ impl ChainSettleContract {
         let inspected_milestones = options.inspected_milestones.clone();
         let proof_submitters = options.proof_submitters.clone();
         let require_dual_attestation = options.require_dual_attestation;
+        let milestone_suppliers = options.milestone_suppliers.clone();
+        let refund_recipient = options.refund_recipient.clone();
 
         if buyer_cancel_fee_bps > constants::MAX_FEE_BPS {
             panic!("buyer_cancel_fee_bps cannot exceed 1000 (10%)");
@@ -6863,6 +7109,76 @@ impl ChainSettleContract {
             &proof_submitters,
             require_dual_attestation,
         );
+
+        // #551: Store per-milestone consortium suppliers when provided.
+        if milestone_suppliers.len() > 0 {
+            if milestone_suppliers.len() != milestones.len() {
+                panic!("milestone_suppliers length must match milestone count");
+            }
+            for i in 0..milestone_suppliers.len() {
+                let ms = milestone_suppliers.get(i).unwrap();
+                let key = DataKeyExt4::MilestoneSupplier(shipment_id.clone(), i);
+                env.storage().persistent().set(&key, &ms);
+                env.storage().persistent().extend_ttl(
+                    &key,
+                    constants::TTL_INITIAL_LEDGERS,
+                    constants::TTL_MAX_LEDGERS,
+                );
+                // Index the consortium shipment under each milestone supplier.
+                let mut ms_shipments: Vec<String> = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::SupplierShipments(ms.clone()))
+                    .unwrap_or_else(|| Vec::new(&env));
+                let mut already_indexed = false;
+                for j in 0..ms_shipments.len() {
+                    if ms_shipments.get(j).unwrap() == shipment_id {
+                        already_indexed = true;
+                        break;
+                    }
+                }
+                if !already_indexed {
+                    ms_shipments.push_back(shipment_id.clone());
+                    env.storage().persistent().set(
+                        &DataKey::SupplierShipments(ms.clone()),
+                        &ms_shipments,
+                    );
+                    env.storage().persistent().extend_ttl(
+                        &DataKey::SupplierShipments(ms.clone()),
+                        constants::TTL_INITIAL_LEDGERS,
+                        constants::TTL_MAX_LEDGERS,
+                    );
+                }
+            }
+            env.storage()
+                .persistent()
+                .set(&DataKeyExt4::IsConsortium(shipment_id.clone()), &true);
+            env.storage().persistent().extend_ttl(
+                &DataKeyExt4::IsConsortium(shipment_id.clone()),
+                constants::TTL_INITIAL_LEDGERS,
+                constants::TTL_MAX_LEDGERS,
+            );
+        }
+
+        // #553: Store the refund recipient when provided.
+        if let Some(ref recipient) = refund_recipient {
+            let blacklisted = env
+                .storage()
+                .instance()
+                .get::<DataKey, soroban_sdk::BytesN<32>>(&DataKey::Blacklisted(recipient.clone()))
+                .is_some();
+            if blacklisted {
+                panic!("refund_recipient is blacklisted");
+            }
+            env.storage()
+                .persistent()
+                .set(&DataKeyExt4::RefundRecipient(shipment_id.clone()), recipient);
+            env.storage().persistent().extend_ttl(
+                &DataKeyExt4::RefundRecipient(shipment_id.clone()),
+                constants::TTL_INITIAL_LEDGERS,
+                constants::TTL_MAX_LEDGERS,
+            );
+        }
 
         // #164: Store per-milestone Unix timestamp deadlines when provided.
         if deadlines.len() > 0 {
@@ -18322,6 +18638,7 @@ impl ChainSettleContract {
             CancellationReason::AdminEmergencyRecovery => {
                 Symbol::new(env, "AdminEmergencyRecovery")
             }
+            CancellationReason::BlacklistedSupplier => Symbol::new(env, "BlacklistedSupplier"),
         };
         let mut data: Map<Symbol, Val> = Map::new(env);
         data.set(Symbol::new(env, "shipment_id"), shipment_id.into_val(env));
@@ -19563,6 +19880,22 @@ impl ChainSettleContract {
             .get(&DataKeyExt3::ProofSubmitters(shipment_id.clone()))
             .unwrap_or_else(|| Vec::new(env));
         if submitters.is_empty() {
+            // #551: consortium shipments — the milestone's assigned supplier submits proof.
+            let is_consortium: bool = env
+                .storage()
+                .persistent()
+                .get(&DataKeyExt4::IsConsortium(shipment_id.clone()))
+                .unwrap_or(false);
+            if is_consortium {
+                return env
+                    .storage()
+                    .persistent()
+                    .get(&DataKeyExt4::MilestoneSupplier(
+                        shipment_id.clone(),
+                        milestone_index,
+                    ))
+                    .unwrap_or_else(|| shipment.supplier.clone());
+            }
             return shipment.supplier.clone();
         }
         submitters
@@ -20143,6 +20476,7 @@ mod test_buyer_vault;
 mod test_standing_orders;
 mod test_allowance_funding;
 mod test_feat_issues;
+mod test_feat_issues_551_553_554_556;
 mod test_feat_earnings;
 // Disabled: exercises milestone insurance holdback / oracle price-condition
 // APIs (see NEW_MILESTONE_FEATURES.md) that have not been implemented yet.
