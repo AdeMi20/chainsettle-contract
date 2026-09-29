@@ -2603,3 +2603,178 @@ Function | Who | Behaviour
 `get_supplier_tier(supplier) → SupplierTier` | Anyone (read-only) | The supplier's tier, computed from their current reputation.
 
 **Tier-change events (#478).** Whenever a supplier's reputation is updated, or their tier collateral discount is calculated at shipment creation, the tier is recomputed and compared with the last recorded tier (Bronze if none was recorded). If it has changed, the new tier is stored and `supplier_tier_changed` `(supplier, old_tier, new_tier)` is emitted. Calling `get_supplier_tier` never emits events and never updates the stored tier.
+
+### VIP Fee Waiver Governance (#490)
+
+Partners (buyers or suppliers) can be granted a VIP fee waiver that reduces their effective platform fee. Because a fee waiver is a standing financial concession, it requires **multisig admin governance** (`initialize_multisig_admin`, see [multisig admin](#multisig-admin)) — unlike pause/unpause there is no single-admin fallback. Any registered multisig admin can propose a waiver; it executes automatically once the routine `MultiAdminConfig.threshold` of distinct admins have approved it.
+
+**Key parameters**
+
+| Parameter | Type | Meaning |
+| --- | --- | --- |
+| `waiver_bps` | `u32` | Basis points of the platform fee to waive. `10_000` = fully waived (0% effective fee). `5_000` = 50% waiver. |
+| `expires_at` | `u64` | Unix timestamp after which the waiver no longer applies. `0` = never expires. |
+
+Function | Who | Behaviour
+--- | --- | ---
+`propose_fee_waiver(admin, partner, waiver_bps, expires_at) → u64` | Any registered multisig admin | Opens a fee-waiver proposal for `partner`. Panics if `waiver_bps > 10_000` or if multisig governance is not configured. The proposer's own approval is recorded immediately. Returns the new `proposal_id`. If the configured threshold is 1, the waiver is granted immediately. Emits `fee_waiver_proposed`.
+`approve_fee_waiver(admin, proposal_id)` | Any registered multisig admin | Records the caller's approval for the pending proposal. Once the total number of distinct approvals reaches `MultiAdminConfig.threshold`, the waiver is granted automatically. Panics if the proposal doesn't exist or the caller has already approved. Emits `fee_waiver_approved`, then `fee_waiver_granted` on execution.
+`get_fee_waiver(partner) → Option<(u32, u64)>` | Anyone (read-only) | Returns `(waiver_bps, expires_at)` for the active grant, or `None` if no waiver was granted or the waiver has expired (timestamp check against the current ledger time).
+`get_fee_waiver_proposal(proposal_id) → Option<FeeWaiverProposal>` | Anyone (read-only) | Returns the pending proposal, or `None` if it never existed or has already executed.
+
+**Fee precedence.** The effective waiver bps is resolved after all other fee steps. When a milestone payment is due, the contract checks whether the partner (buyer or supplier, depending on context) has an active non-expired fee waiver and reduces the platform fee proportionally.
+
+**Worked example** — 50% waiver, 1% base fee, 1 000 000 unit payout
+
+| Step | Value |
+| --- | --- |
+| Base platform fee (`fee_bps = 100`, i.e. 1%) | `10_000` |
+| Waiver (`waiver_bps = 5_000`, i.e. 50%) | `−5_000` |
+| Net platform fee | `5_000` (0.5%) |
+| Supplier receives | `995_000` |
+
+**Usage example** — propose and approve a 50% perpetual waiver in a 2-of-3 multisig
+
+```bash
+# Admin A proposes
+stellar contract invoke --id <CONTRACT_ID> --source admin-a \
+  --network testnet -- propose_fee_waiver \
+  --admin <ADMIN_A_ADDRESS> \
+  --partner <PARTNER_ADDRESS> \
+  --waiver_bps 5000 \
+  --expires_at 0
+
+# Admin B approves (threshold = 2, so this executes the waiver)
+stellar contract invoke --id <CONTRACT_ID> --source admin-b \
+  --network testnet -- approve_fee_waiver \
+  --admin <ADMIN_B_ADDRESS> \
+  --proposal_id 1
+
+# Check the active waiver
+stellar contract invoke --id <CONTRACT_ID> \
+  --network testnet -- get_fee_waiver \
+  --partner <PARTNER_ADDRESS>
+```
+
+> **Note:** `initialize_multisig_admin` must be called before any fee waiver can be proposed.
+
+---
+
+### Fee Holidays (#491)
+
+Admins can schedule a contract-wide **zero-fee window** measured in Stellar ledger sequence numbers. While a fee holiday is active, `deduct_fee*` returns the full gross amount for all shipments — no platform fee is charged to any party. A fee holiday is orthogonal to per-partner fee waivers and volume-based fee tiers: the holiday takes precedence while active regardless of other fee settings.
+
+Function | Who | Behaviour
+--- | --- | ---
+`schedule_fee_holiday(admin, start_ledger, end_ledger)` | Admin | Stores the fee holiday window. `start_ledger` and `end_ledger` are inclusive Stellar ledger sequence numbers. Panics if `end_ledger < start_ledger`. Replaces any previously scheduled holiday. Emits `fee_holiday_scheduled (start_ledger, end_ledger)`.
+`cancel_fee_holiday(admin)` | Admin | Removes any scheduled or active fee holiday immediately. Emits `fee_holiday_cancelled`.
+`is_fee_holiday_active() → bool` | Anyone (read-only) | Returns `true` when the current ledger sequence is within `[start_ledger, end_ledger]` (both endpoints inclusive).
+
+**Ledger numbers, not timestamps.** The window is expressed in Stellar ledger sequence numbers. On Stellar mainnet a ledger closes roughly every 5 seconds, so ~17 280 ledgers ≈ 1 day, but exact timing depends on network conditions and should not be assumed for precise scheduling.
+
+**Interaction with other fee settings.** A fee holiday supersedes per-partner fee waivers, per-shipment fee overrides, volume-tier discounts, and the long-hold rebate for the duration of the window. Once the holiday ends (ledger sequence > `end_ledger`), all previously configured settings resume automatically.
+
+**Usage example** — schedule a 24-hour holiday starting 100 ledgers from now
+
+```bash
+# Assume current ledger is 5_000_000; ~24 h ≈ 17 280 ledgers
+stellar contract invoke --id <CONTRACT_ID> --source admin-account \
+  --network testnet -- schedule_fee_holiday \
+  --admin <ADMIN_ADDRESS> \
+  --start_ledger 5000100 \
+  --end_ledger 5017380
+
+# Check if a holiday is currently active
+stellar contract invoke --id <CONTRACT_ID> \
+  --network testnet -- is_fee_holiday_active
+
+# Cancel the holiday early if needed
+stellar contract invoke --id <CONTRACT_ID> --source admin-account \
+  --network testnet -- cancel_fee_holiday \
+  --admin <ADMIN_ADDRESS>
+```
+
+---
+
+### Supplier Payout Currency Preference & Conversion Rates (#492)
+
+Suppliers can nominate a preferred settlement token. When a supplier calls `claim_payout`, the contract attempts to deliver funds in the preferred token if an admin has registered a conversion route and the contract holds enough of the target token. Rates are fixed (no live oracle is queried) and conversion is always best-effort — if the route is missing or the contract balance is insufficient, the payout is delivered in the original token unchanged.
+
+**Key parameter**
+
+| Parameter | Type | Meaning |
+| --- | --- | --- |
+| `rate_bps` | `u32` | Basis points of `to_token` per unit of `from_token`. `10_000` = 1:1 parity. E.g. `8_000` means 1 unit of `from_token` → 0.8 units of `to_token`. |
+
+Function | Who | Behaviour
+--- | --- | ---
+`set_payout_currency_preference(supplier, preferred_token)` | Supplier | Stores the supplier's preferred output token for `claim_payout`. Auth required from `supplier`. Emits `payout_currency_preference_set`.
+`get_payout_currency_preference(supplier) → Option<Address>` | Anyone (read-only) | Returns the configured preferred token address, or `None` if none is set.
+`set_conversion_rate(admin, from_token, to_token, rate_bps)` | Admin | Registers a fixed conversion route used by `claim_payout`. Panics if `rate_bps = 0`. Emits `conversion_rate_set`. Overwrites any existing route for the same pair.
+`clear_conversion_rate(admin, from_token, to_token)` | Admin | Removes a previously registered route. Emits `conversion_rate_cleared`.
+`get_conversion_rate(from_token, to_token) → Option<u32>` | Anyone (read-only) | Returns the registered rate in basis points, or `None` if no route exists.
+`claim_payout(supplier, token)` | Supplier | Transfers the supplier's full accumulated pending balance. If a preference is set, it differs from `token`, a conversion route exists, and the contract holds enough of the preferred token, the payout is converted and paid in the preferred token; otherwise it is paid in `token` unchanged. The balance is zeroed before transfer (checks-effects-interactions). Panics with `"no pending payout"` if balance is zero. Blocked while paused. Emits `payout_claimed (amount, payout_token, rate_bps)`.
+
+**Conversion only happens when both conditions hold:**
+1. The supplier has called `set_payout_currency_preference` with a token different from `token`.
+2. An admin has called `set_conversion_rate` for `(token → preferred_token)` and the contract holds at least the converted amount of `preferred_token`.
+
+If either condition is missing, `claim_payout` falls back to `token` with no error.
+
+**Worked example** — supplier earns USDC, wants payout in EURC at 0.92:1
+
+```bash
+# Admin registers the USDC → EURC route at 9200 bps (0.92 EURC per USDC)
+stellar contract invoke --id <CONTRACT_ID> --source admin-account \
+  --network testnet -- set_conversion_rate \
+  --admin <ADMIN_ADDRESS> \
+  --from_token <USDC_ADDRESS> \
+  --to_token <EURC_ADDRESS> \
+  --rate_bps 9200
+
+# Supplier sets preference
+stellar contract invoke --id <CONTRACT_ID> --source supplier-account \
+  --network testnet -- set_payout_currency_preference \
+  --supplier <SUPPLIER_ADDRESS> \
+  --preferred_token <EURC_ADDRESS>
+
+# Claim: 100 000 USDC pending → supplier receives 92 000 EURC
+stellar contract invoke --id <CONTRACT_ID> --source supplier-account \
+  --network testnet -- claim_payout \
+  --supplier <SUPPLIER_ADDRESS> \
+  --token <USDC_ADDRESS>
+
+# Without a conversion route (or if EURC balance is insufficient), the same
+# call would pay out 100 000 USDC instead — no error, no partial conversion.
+```
+
+---
+
+### Jurisdiction Tagging (#493)
+
+Every shipment can carry an immutable jurisdiction/compliance tag — a `Symbol` set via `ShipmentOptions.jurisdiction` at creation time and never changeable afterwards. The tag is designed for off-chain compliance tooling: regulatory pipelines, audit exporters, and reporting dashboards can query by jurisdiction to filter or enumerate the shipments they need to process.
+
+Function | Who | Behaviour
+--- | --- | ---
+`get_shipment_jurisdiction(shipment_id) → Option<Symbol>` | Anyone (read-only) | Returns the jurisdiction tag for the shipment, or `None` if no tag was set at creation.
+`get_shipments_by_jurisdiction(jurisdiction) → Vec<String>` | Anyone (read-only) | Returns all shipment IDs that carry the given tag, in insertion order. Returns an empty list if no shipments have been tagged with that jurisdiction.
+
+**Setting the tag.** The tag is set once via the `jurisdiction` field on `ShipmentOptions` when `create_shipment` (or `create_shipment_from_template`) is called. It cannot be updated or removed after the shipment is created.
+
+**Example tag values:** `US`, `EU_MIFID`, `SG_MAS`, `UK_FCA`, `OFAC_SDN`.
+
+**Intended use case.** The jurisdiction tag has no effect on contract logic — it does not gate any function, block payouts, or interact with dispute resolution. It exists purely as an on-chain label for off-chain tooling to consume. For example, a compliance reporter can call `get_shipments_by_jurisdiction("EU_MIFID")` to retrieve all EU MiFID-tagged trades and export them for regulatory filing without scanning every shipment.
+
+**Usage example**
+
+```bash
+# Read the tag for a specific shipment
+stellar contract invoke --id <CONTRACT_ID> \
+  --network testnet -- get_shipment_jurisdiction \
+  --shipment_id "shipment-001"
+
+# List all shipments under US jurisdiction
+stellar contract invoke --id <CONTRACT_ID> \
+  --network testnet -- get_shipments_by_jurisdiction \
+  --jurisdiction US
+```
