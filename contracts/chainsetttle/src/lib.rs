@@ -1563,31 +1563,18 @@ pub enum DataKeyExt4 {
     MilestoneSupplier(String, u32),
     ShipmentHadDispute(String),
 
-    // ── #553 Configurable refund recipient ────────────────────────────────
-    /// Buyer-set alternative address that receives all refunds for a shipment.
-    RefundRecipient(String),
+    // ── Appeal fee ────────────────────────────────────────────────────────
+    /// Admin-configured flat fee (in the shipment token) charged on `appeal_dispute`
+    /// (0 = no fee).
+    AppealFee,
+    /// Fee escrowed for an appeal on (shipment_id, milestone_index): (appellant, amount).
+    /// Refunded to the appellant if the appeal succeeds, else paid to the appeal arbiter.
+    AppealFeeDeposit(String, u32),
 
-    // ── #551 Consortium milestone suppliers ───────────────────────────────
-    /// Whether this shipment was created with per-milestone consortium suppliers.
-    IsConsortium(String),
-
-    // ── Summary / earnings / ratings (referenced by code, missing from enum) ─
-    /// Admin-configured maximum batch size for summary queries.
-    MaxSummaryBatch,
-    /// Cumulative tokens earned by a supplier for a given token.
-    SupplierEarned(Address, Address),
-    /// Cumulative tokens spent by a buyer for a given token.
-    BuyerSpent(Address, Address),
-    /// Dispute history entries for an address.
-    DisputeHistory(Address),
-    /// Admin-configured rolling window (ledgers) within which a rating can be submitted.
-    RatingWindowLedgers,
-    /// Flag: whether a given (shipment, caller) has already submitted a rating.
-    ShipmentRated(String, Address),
-    /// Ledger at which a shipment was completed, used to gate rating submissions.
-    CompletedAtLedger(String),
-    /// Aggregate rating data for an address.
-    RatingAgg(Address),
+    // ── Arbiter availability ──────────────────────────────────────────────
+    /// True when an arbiter has marked themselves unavailable; they are then
+    /// skipped by pool selection (absent = available).
+    ArbiterUnavailable(Address),
 }
 
 /// #517 – Pending proposal to merge two adjacent Pending milestones.
@@ -2648,6 +2635,38 @@ impl ChainSettleContract {
             .instance()
             .get(&DataKeyExt2::AppealWindowLedgers)
             .unwrap_or(0)
+    }
+
+    /// Set the flat fee (in the shipment token) the appellant pays when calling
+    /// `appeal_dispute` (0 = no fee). The fee is refunded if the appeal succeeds
+    /// and paid to the appeal arbiter otherwise.
+    pub fn set_appeal_fee(env: Env, admin: Address, amount: i128) {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        if amount < 0 {
+            panic!("appeal fee cannot be negative");
+        }
+        env.storage().instance().set(&DataKeyExt4::AppealFee, &amount);
+        env.events()
+            .publish((Symbol::new(&env, "appeal_fee_set"),), amount);
+    }
+
+    pub fn get_appeal_fee(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKeyExt4::AppealFee)
+            .unwrap_or(0)
+    }
+
+    /// Returns the escrowed appeal fee for a milestone as (appellant, amount), if any.
+    pub fn get_appeal_fee_deposit(
+        env: Env,
+        shipment_id: String,
+        milestone_index: u32,
+    ) -> Option<(Address, i128)> {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt4::AppealFeeDeposit(shipment_id, milestone_index))
     }
 
     // ----------------------------------------------------------
@@ -4902,6 +4921,7 @@ impl ChainSettleContract {
         keys.push_back(DataKeyExt2::DisputeAppealed(s.clone(), idx).into_val(env));
         keys.push_back(DataKeyExt2::MediationProposal(s.clone(), idx).into_val(env));
         keys.push_back(DataKeyExt2::DisputeAppealOriginal(s.clone(), idx).into_val(env));
+        keys.push_back(DataKeyExt4::AppealFeeDeposit(s.clone(), idx).into_val(env));
         keys.push_back(DataKeyExt2::DisputeResolvedApprove(s.clone(), idx).into_val(env));
         keys.push_back(DataKeyExt2::DisputeResolutionReason(s.clone(), idx).into_val(env));
         keys.push_back(DataKeyExt2::ExtensionRequestCount(s.clone(), idx).into_val(env));
@@ -6183,6 +6203,41 @@ impl ChainSettleContract {
     }
 
     // ----------------------------------------------------------
+    // ARBITER AVAILABILITY
+    // ----------------------------------------------------------
+
+    /// An arbiter marks themselves available or unavailable for new assignments.
+    /// Unavailable arbiters stay in the pool but are skipped by pool selection
+    /// (pool-arbiter disputes, appeals and panel assignment). Existing
+    /// assignments are unaffected.
+    pub fn set_arbiter_availability(env: Env, arbiter: Address, available: bool) {
+        arbiter.require_auth();
+        let key = DataKeyExt4::ArbiterUnavailable(arbiter.clone());
+        if available {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &true);
+            env.storage().persistent().extend_ttl(
+                &key,
+                constants::TTL_INITIAL_LEDGERS,
+                constants::TTL_MAX_LEDGERS,
+            );
+        }
+        env.events().publish(
+            (Symbol::new(&env, "arbiter_availability_set"), arbiter),
+            available,
+        );
+    }
+
+    /// Whether `arbiter` is currently accepting new assignments (default true).
+    pub fn is_arbiter_available(env: Env, arbiter: Address) -> bool {
+        !env.storage()
+            .persistent()
+            .get(&DataKeyExt4::ArbiterUnavailable(arbiter))
+            .unwrap_or(false)
+    }
+
+    // ----------------------------------------------------------
     // #470: ARBITER REPETITION GUARD
     // ----------------------------------------------------------
 
@@ -6217,7 +6272,8 @@ impl ChainSettleContract {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
-    /// Admin assigns an N-member arbiter panel, drawn from the pool, to a
+    /// Admin assigns an N-member arbiter panel, drawn pseudo-randomly (via
+    /// `env.prng()`) from the pool, to a
     /// shipment with an open dispute on `milestone_index`. Arbiters in the
     /// supplier's recent history are skipped when the pool allows it; otherwise
     /// the least-recently-used ones are reused. The shipment's buyers and
@@ -6258,7 +6314,10 @@ impl ChainSettleContract {
 
         let mut exclude = shipment.buyers.clone();
         exclude.push_back(shipment.supplier.clone());
-        let pool = Self::get_arbiter_pool(env.clone());
+        // Shuffle a copy of the pool with the host PRNG so panel membership is
+        // pseudo-random rather than always the first N arbiters in pool order.
+        let mut pool = Self::get_arbiter_pool(env.clone());
+        env.prng().shuffle(&mut pool);
         let picked = Self::select_pool_arbiters(
             &env,
             &shipment.supplier,
@@ -6297,6 +6356,7 @@ impl ChainSettleContract {
     /// if that cannot fill `count`, the remaining slots fall back to recent
     /// arbiters, least-recently-assigned first. With the guard disabled the
     /// result is simply the first eligible arbiters in round-robin order.
+    /// Arbiters who have marked themselves unavailable are never picked.
     fn select_pool_arbiters(
         env: &Env,
         supplier: &Address,
@@ -6323,7 +6383,10 @@ impl ChainSettleContract {
             }
             let idx = (start + step) % len;
             let candidate = pool.get(idx).unwrap();
-            if exclude.contains(&candidate) || recent.contains(&candidate) {
+            if exclude.contains(&candidate)
+                || recent.contains(&candidate)
+                || !Self::is_arbiter_available(env.clone(), candidate.clone())
+            {
                 continue;
             }
             picked.push_back(idx);
@@ -6335,7 +6398,9 @@ impl ChainSettleContract {
                 break;
             }
             let candidate = recent.get(r).unwrap();
-            if exclude.contains(&candidate) {
+            if exclude.contains(&candidate)
+                || !Self::is_arbiter_available(env.clone(), candidate.clone())
+            {
                 continue;
             }
             if let Some(idx) = pool.first_index_of(&candidate) {
@@ -7899,7 +7964,11 @@ impl ChainSettleContract {
             .get(&DataKeyExt::PayoutMode(shipment.supplier.clone()))
             .unwrap_or(PayoutMode::Immediate);
 
-        if payout_mode == PayoutMode::Batched {
+        if let Some(financier) = Self::payout_assignee(&env, &shipment_id) {
+            // Invoice factoring: the advance belongs to the receivable's holder.
+            let token_client = token::Client::new(&env, &shipment.token);
+            token_client.transfer(&env.current_contract_address(), &financier, &advance_amount);
+        } else if payout_mode == PayoutMode::Batched {
             let pending: i128 = env
                 .storage()
                 .persistent()
@@ -9728,7 +9797,7 @@ impl ChainSettleContract {
                 &Vec::new(&env),
             )
             .get(0)
-            .unwrap_or(idx);
+            .unwrap_or_else(|| panic!("NoArbitersAvailable"));
             let next_idx = (chosen_idx + 1) % pool.len() as u32;
             let old_arbiter = shipment.arbiter.clone();
             shipment.arbiter = pool.get(chosen_idx).unwrap();
@@ -10255,7 +10324,23 @@ impl ChainSettleContract {
 
             shipment.released_amount += payment;
 
-            let actual_transfer = (net_payment - advance_deducted - arbiter_fee).max(0);
+            // Loser-pays: the buyer lost, so the bond they get back covers the fee first.
+            // Not for a supplier grade dispute — the buyer did not post a bond for it.
+            let bond_return = if grade_dispute.is_none() {
+                shipment.dispute_bond_amount.max(0)
+            } else {
+                0
+            };
+            let loser_cover = Self::loser_pays_cover(
+                &env,
+                &shipment_id,
+                milestone_index,
+                arbiter_fee,
+                bond_return,
+            );
+
+            let actual_transfer =
+                (net_payment - advance_deducted - (arbiter_fee - loser_cover)).max(0);
             if actual_transfer > 0 {
                 // Feature C: split payment across milestone payees if configured.
                 Self::pay_milestone_to_payees(
@@ -10269,13 +10354,13 @@ impl ChainSettleContract {
             }
 
             // Return the dispute bond to the buyer (they raised a valid dispute).
-            // Not for a supplier grade dispute — the buyer did not raise it.
-            if shipment.dispute_bond_amount > 0 && grade_dispute.is_none() {
+            let bond_refund = bond_return - loser_cover;
+            if bond_refund > 0 {
                 let primary_buyer = shipment.buyers.get(0).unwrap();
                 token_client.transfer(
                     &env.current_contract_address(),
                     &primary_buyer,
-                    &shipment.dispute_bond_amount,
+                    &bond_refund,
                 );
             }
 
@@ -10298,6 +10383,15 @@ impl ChainSettleContract {
                     &arbiter_fee,
                 );
             }
+            // Loser-pays: the supplier's failed challenge is paid from their graded share.
+            let graded_share = (payment * grade_bps as i128) / 10_000;
+            let loser_cover = Self::loser_pays_cover(
+                &env,
+                &shipment_id,
+                milestone_index,
+                arbiter_fee,
+                graded_share,
+            );
             let (_, buyer_refund, _) = Self::pay_graded_split(
                 &env,
                 &shipment,
@@ -10305,7 +10399,8 @@ impl ChainSettleContract {
                 milestone_index,
                 payment,
                 grade_bps,
-                arbiter_fee,
+                arbiter_fee - loser_cover,
+                loser_cover,
             );
             shipment.released_amount += payment;
             Self::decrease_total_escrowed(&env, &shipment.token, payment);
@@ -10328,7 +10423,18 @@ impl ChainSettleContract {
                 );
             }
 
-            let buyer_refund = (payment - arbiter_fee).max(0);
+            // Loser-pays: the supplier lost the contested portion, so the bond
+            // forfeited to them covers the fee first.
+            let bond_forfeit = shipment.dispute_bond_amount.max(0);
+            let loser_cover = Self::loser_pays_cover(
+                &env,
+                &shipment_id,
+                milestone_index,
+                arbiter_fee,
+                bond_forfeit,
+            );
+
+            let buyer_refund = (payment - (arbiter_fee - loser_cover)).max(0);
             if buyer_refund > 0 {
                 let primary_buyer = shipment.buyers.get(0).unwrap();
                 token_client.transfer(
@@ -10342,11 +10448,12 @@ impl ChainSettleContract {
             shipment.released_amount += payment;
 
             // Forfeit the dispute bond to the supplier (buyer's challenge failed).
-            if shipment.dispute_bond_amount > 0 {
+            let bond_to_supplier = bond_forfeit - loser_cover;
+            if bond_to_supplier > 0 {
                 token_client.transfer(
                     &env.current_contract_address(),
                     &shipment.supplier,
-                    &shipment.dispute_bond_amount,
+                    &bond_to_supplier,
                 );
             }
 
@@ -10445,6 +10552,9 @@ impl ChainSettleContract {
             &DataKeyExt2::DisputeResolutionReason(shipment_id.clone(), milestone_index),
             &reason,
         );
+
+        // Appeal fee: refund if the appeal ruled for the appellant, else pay the appeal arbiter.
+        Self::settle_appeal_fee(&env, &shipment, &shipment_id, milestone_index, approve);
 
         // #372: If this resolution is the second (appeal) resolution of this
         // dispute cycle, compare it against the original arbiter's outcome —
@@ -10696,7 +10806,18 @@ impl ChainSettleContract {
 
         shipment.released_amount += payment;
 
-        let actual_transfer = (net_payment - advance_deducted - arbiter_fee).max(0);
+        // Loser-pays: the buyer lost, so the bond they get back covers the fee first.
+        let bond_return = shipment.dispute_bond_amount.max(0);
+        let loser_cover = Self::loser_pays_cover(
+            &env,
+            &shipment_id,
+            milestone_index,
+            arbiter_fee,
+            bond_return,
+        );
+
+        let actual_transfer =
+            (net_payment - advance_deducted - (arbiter_fee - loser_cover)).max(0);
         if actual_transfer > 0 {
             Self::pay_milestone_to_payees(
                 &env,
@@ -10721,12 +10842,13 @@ impl ChainSettleContract {
             );
         }
 
-        if shipment.dispute_bond_amount > 0 {
+        let bond_refund = bond_return - loser_cover;
+        if bond_refund > 0 {
             let primary_buyer = shipment.buyers.get(0).unwrap();
             token_client.transfer(
                 &env.current_contract_address(),
                 &primary_buyer,
-                &shipment.dispute_bond_amount,
+                &bond_refund,
             );
         }
 
@@ -10881,6 +11003,25 @@ impl ChainSettleContract {
         shipment.open_dispute_count += 1;
         shipment.milestones.set(milestone_index, milestone);
 
+        // Escrow the appeal fee; settled when the appeal is resolved.
+        let appeal_fee = Self::get_appeal_fee(env.clone());
+        if appeal_fee > 0 {
+            token::Client::new(&env, &shipment.token).transfer(
+                &caller,
+                &env.current_contract_address(),
+                &appeal_fee,
+            );
+            let deposit_key = DataKeyExt4::AppealFeeDeposit(shipment_id.clone(), milestone_index);
+            env.storage()
+                .persistent()
+                .set(&deposit_key, &(caller.clone(), appeal_fee));
+            env.storage().persistent().extend_ttl(
+                &deposit_key,
+                constants::TTL_INITIAL_LEDGERS,
+                constants::TTL_MAX_LEDGERS,
+            );
+        }
+
         env.storage().persistent().set(&appealed_key, &true);
         env.storage().persistent().remove(&resolved_key);
 
@@ -10891,6 +11032,56 @@ impl ChainSettleContract {
         env.events().publish(
             (Symbol::new(&env, "dispute_appealed"), shipment_id),
             (milestone_index, caller, new_arbiter),
+        );
+    }
+
+    /// Settles an escrowed appeal fee once the appeal's resolution is known. The appeal
+    /// succeeds when it rules for the appellant (supplier → `approve`, buyer → `!approve`);
+    /// the fee is then refunded to the appellant. Otherwise it is paid to the arbiter who
+    /// heard the appeal. No-op when no fee was escrowed.
+    fn settle_appeal_fee(
+        env: &Env,
+        shipment: &Shipment,
+        shipment_id: &String,
+        milestone_index: u32,
+        approve: bool,
+    ) {
+        let key = DataKeyExt4::AppealFeeDeposit(shipment_id.clone(), milestone_index);
+        let (appellant, amount) = match env
+            .storage()
+            .persistent()
+            .get::<DataKeyExt4, (Address, i128)>(&key)
+        {
+            Some(d) => d,
+            None => return,
+        };
+        env.storage().persistent().remove(&key);
+
+        let appeal_succeeded = if appellant == shipment.supplier {
+            approve
+        } else {
+            !approve
+        };
+        let recipient = if appeal_succeeded {
+            appellant.clone()
+        } else {
+            shipment.arbiter.clone()
+        };
+        if amount > 0 {
+            token::Client::new(env, &shipment.token).transfer(
+                &env.current_contract_address(),
+                &recipient,
+                &amount,
+            );
+        }
+        let event = if appeal_succeeded {
+            "appeal_fee_refunded"
+        } else {
+            "appeal_fee_forfeited"
+        };
+        env.events().publish(
+            (Symbol::new(env, event), shipment_id.clone()),
+            (milestone_index, recipient, amount),
         );
     }
 
@@ -14397,6 +14588,7 @@ impl ChainSettleContract {
                 milestone_index,
                 majority_approve,
                 arbiter,
+                &votes,
             );
         }
     }
@@ -14409,6 +14601,7 @@ impl ChainSettleContract {
         milestone_index: u32,
         approve: bool,
         resolver: Address,
+        votes: &Vec<DisputeVote>,
     ) {
         let ctx = Self::fetch_resolve_dispute_ctx(env, &shipment_id, milestone_index);
         let mut shipment = ctx.shipment;
@@ -14446,33 +14639,28 @@ impl ChainSettleContract {
             Self::check_address_outflow(env, &shipment.supplier, payment);
 
             let fee_bps = Self::applicable_arbiter_fee_bps(env, payment, shipment.arbiter_fee_bps);
-            // For panel, fee is split equally among all panel members.
-            let panel: Vec<Address> = env
-                .storage()
-                .persistent()
-                .get(&DataKeyExt::ArbiterPanel(shipment_id.clone()))
-                .unwrap_or_else(|| Vec::new(env));
-            let arbiter_fee_total = (payment * fee_bps as i128) / 10_000;
-            if arbiter_fee_total > 0 && !panel.is_empty() {
-                let per_arbiter = arbiter_fee_total / panel.len() as i128;
-                let mut distributed: i128 = 0;
-                for i in 0..panel.len() {
-                    let p = panel.get(i).unwrap();
-                    let amount = if i == panel.len() - 1 {
-                        // Last arbiter gets remainder to avoid dust loss.
-                        arbiter_fee_total - distributed
-                    } else {
-                        per_arbiter
-                    };
-                    if amount > 0 {
-                        token_client.transfer(&env.current_contract_address(), &p, &amount);
-                        distributed += amount;
-                    }
-                }
-            }
+            let arbiter_fee_total = Self::distribute_panel_fee(
+                env,
+                &token_client,
+                &shipment_id,
+                milestone_index,
+                votes,
+                (payment * fee_bps as i128) / 10_000,
+            );
 
             shipment.released_amount += payment;
-            let actual_transfer = (net_payment - advance_deducted - arbiter_fee_total).max(0);
+
+            // Loser-pays: the buyer lost, so the bond they get back covers the fee first.
+            let bond_return = shipment.dispute_bond_amount.max(0);
+            let loser_cover = Self::loser_pays_cover(
+                env,
+                &shipment_id,
+                milestone_index,
+                arbiter_fee_total,
+                bond_return,
+            );
+            let actual_transfer =
+                (net_payment - advance_deducted - (arbiter_fee_total - loser_cover)).max(0);
 
             // Feature C: split payment across milestone payees if configured.
             Self::pay_milestone_to_payees(
@@ -14497,12 +14685,13 @@ impl ChainSettleContract {
                 );
             }
 
-            if shipment.dispute_bond_amount > 0 {
+            let bond_refund = bond_return - loser_cover;
+            if bond_refund > 0 {
                 let primary_buyer = shipment.buyers.get(0).unwrap();
                 token_client.transfer(
                     &env.current_contract_address(),
                     &primary_buyer,
-                    &shipment.dispute_bond_amount,
+                    &bond_refund,
                 );
             }
 
@@ -14512,28 +14701,14 @@ impl ChainSettleContract {
             panel_outcome = Some(DisputeOutcome::Supplier);
         } else if is_partial {
             let fee_bps = Self::applicable_arbiter_fee_bps(env, payment, shipment.arbiter_fee_bps);
-            let panel: Vec<Address> = env
-                .storage()
-                .persistent()
-                .get(&DataKeyExt::ArbiterPanel(shipment_id.clone()))
-                .unwrap_or_else(|| Vec::new(env));
-            let arbiter_fee_total = (payment * fee_bps as i128) / 10_000;
-            if arbiter_fee_total > 0 && !panel.is_empty() {
-                let per_arbiter = arbiter_fee_total / panel.len() as i128;
-                let mut distributed: i128 = 0;
-                for i in 0..panel.len() {
-                    let p = panel.get(i).unwrap();
-                    let amount = if i == panel.len() - 1 {
-                        arbiter_fee_total - distributed
-                    } else {
-                        per_arbiter
-                    };
-                    if amount > 0 {
-                        token_client.transfer(&env.current_contract_address(), &p, &amount);
-                        distributed += amount;
-                    }
-                }
-            }
+            let arbiter_fee_total = Self::distribute_panel_fee(
+                env,
+                &token_client,
+                &shipment_id,
+                milestone_index,
+                votes,
+                (payment * fee_bps as i128) / 10_000,
+            );
             let buyer_refund = (payment - arbiter_fee_total).max(0);
             if buyer_refund > 0 {
                 let primary_buyer = shipment.buyers.get(0).unwrap();
@@ -14544,11 +14719,12 @@ impl ChainSettleContract {
                 );
             }
             shipment.released_amount += payment;
-            if shipment.dispute_bond_amount > 0 {
+            let bond_to_supplier = bond_forfeit - loser_cover;
+            if bond_to_supplier > 0 {
                 token_client.transfer(
                     &env.current_contract_address(),
                     &shipment.supplier,
-                    &shipment.dispute_bond_amount,
+                    &bond_to_supplier,
                 );
             }
             let mut m = shipment.milestones.get(milestone_index).unwrap();
@@ -14689,6 +14865,42 @@ impl ChainSettleContract {
             &resolver,
             None,
         );
+    }
+
+    /// Splits a panel dispute's arbiter fee equally among the panel members who actually
+    /// voted (non-voters earn nothing). The last voter receives the rounding remainder so
+    /// no dust is left behind. Returns the amount paid out (0 when there were no voters).
+    fn distribute_panel_fee(
+        env: &Env,
+        token_client: &token::Client,
+        shipment_id: &String,
+        milestone_index: u32,
+        votes: &Vec<DisputeVote>,
+        fee_total: i128,
+    ) -> i128 {
+        let voters = votes.len();
+        if fee_total <= 0 || voters == 0 {
+            return 0;
+        }
+        let per_voter = fee_total / voters as i128;
+        let mut distributed: i128 = 0;
+        for i in 0..voters {
+            let voter = votes.get(i).unwrap().arbiter;
+            let amount = if i == voters - 1 {
+                fee_total - distributed
+            } else {
+                per_voter
+            };
+            if amount > 0 {
+                token_client.transfer(&env.current_contract_address(), &voter, &amount);
+                distributed += amount;
+            }
+        }
+        env.events().publish(
+            (Symbol::new(env, "panel_fee_distributed"), shipment_id.clone()),
+            (milestone_index, voters, distributed),
+        );
+        distributed
     }
 
     /// Returns the current votes for a panel dispute identified by shipment and milestone.
@@ -16779,6 +16991,16 @@ impl ChainSettleContract {
         if net_amount <= 0 {
             return;
         }
+        // Invoice factoring: an assigned receivable pays the financier directly,
+        // overriding payee splits and supplier batching.
+        if let Some(financier) = Self::payout_assignee(env, shipment_id) {
+            token_client.transfer(&env.current_contract_address(), &financier, &net_amount);
+            env.events().publish(
+                (Symbol::new(env, "assigned_payout"), shipment_id.clone()),
+                (milestone_index, financier, net_amount),
+            );
+            return;
+        }
         let payees: Vec<MilestonePayee> = env
             .storage()
             .persistent()
@@ -18719,6 +18941,225 @@ impl ChainSettleContract {
 }
 
 // ============================================================
+// INVOICE FACTORING & LOSER-PAYS ARBITER FEE
+// ============================================================
+
+#[contractimpl]
+impl ChainSettleContract {
+    // ----------------------------------------------------------
+    // INVOICE FACTORING: PAYOUT ASSIGNMENT
+    // ----------------------------------------------------------
+
+    /// Assign all future supplier payouts on `shipment_id` to `financier`.
+    ///
+    /// Both the supplier and the financier must authorise. While the assignment
+    /// is active, milestone payments and approved advances are sent straight to
+    /// the financier (payee splits and batched payout mode are bypassed). The
+    /// supplier cannot revoke it; only the financier can release or transfer it.
+    pub fn assign_payout(env: Env, supplier: Address, shipment_id: String, financier: Address) {
+        Self::assert_not_paused(&env);
+        supplier.require_auth();
+        financier.require_auth();
+
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        if shipment.supplier != supplier {
+            panic!("only supplier can assign payout");
+        }
+        if financier == supplier {
+            panic!("financier must differ from supplier");
+        }
+        if Self::is_blacklisted(env.clone(), financier.clone()) {
+            panic!("financier is blacklisted");
+        }
+        if shipment.open_dispute_count > 0 {
+            panic!("cannot assign payout during open dispute");
+        }
+        let key = DataKeyExt4::PayoutAssignment(shipment_id.clone());
+        if env.storage().persistent().has(&key) {
+            panic!("payout already assigned");
+        }
+
+        let assignment = PayoutAssignment {
+            supplier: supplier.clone(),
+            financier: financier.clone(),
+            assigned_at_ledger: env.ledger().sequence(),
+        };
+        env.storage().persistent().set(&key, &assignment);
+
+        env.events().publish(
+            (Symbol::new(&env, "payout_assigned"), shipment_id),
+            (supplier, financier),
+        );
+    }
+
+    /// Current financier sells the receivable on to `new_financier`.
+    /// Both financiers must authorise.
+    pub fn transfer_payout_assignment(
+        env: Env,
+        financier: Address,
+        shipment_id: String,
+        new_financier: Address,
+    ) {
+        Self::assert_not_paused(&env);
+        financier.require_auth();
+        new_financier.require_auth();
+
+        let key = DataKeyExt4::PayoutAssignment(shipment_id.clone());
+        let mut assignment: PayoutAssignment = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic!("payout not assigned"));
+        if assignment.financier != financier {
+            panic!("only current financier can transfer assignment");
+        }
+        if new_financier == financier || new_financier == assignment.supplier {
+            panic!("invalid new financier");
+        }
+        if Self::is_blacklisted(env.clone(), new_financier.clone()) {
+            panic!("financier is blacklisted");
+        }
+
+        assignment.financier = new_financier.clone();
+        assignment.assigned_at_ledger = env.ledger().sequence();
+        env.storage().persistent().set(&key, &assignment);
+
+        env.events().publish(
+            (Symbol::new(&env, "payout_assignment_transferred"), shipment_id),
+            (financier, new_financier),
+        );
+    }
+
+    /// Financier releases the assignment (e.g. once repaid off-chain); future
+    /// payouts go back to the supplier.
+    pub fn release_payout_assignment(env: Env, financier: Address, shipment_id: String) {
+        financier.require_auth();
+
+        let key = DataKeyExt4::PayoutAssignment(shipment_id.clone());
+        let assignment: PayoutAssignment = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic!("payout not assigned"));
+        if assignment.financier != financier {
+            panic!("only current financier can release assignment");
+        }
+        env.storage().persistent().remove(&key);
+
+        env.events().publish(
+            (Symbol::new(&env, "payout_assignment_released"), shipment_id),
+            (assignment.supplier, financier),
+        );
+    }
+
+    /// Active payout assignment for a shipment, if any.
+    pub fn get_payout_assignment(env: Env, shipment_id: String) -> Option<PayoutAssignment> {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt4::PayoutAssignment(shipment_id))
+    }
+
+    // ----------------------------------------------------------
+    // LOSER-PAYS ARBITER FEE ALLOCATION
+    // ----------------------------------------------------------
+
+    /// Opt a shipment in (or out) of loser-pays arbiter fee allocation.
+    ///
+    /// A buyer and the supplier must both authorise, and no dispute may be open.
+    /// When enabled, the arbiter fee on a resolution is charged first against
+    /// funds the losing party would otherwise receive from the resolution (the
+    /// buyer's returned dispute bond, the bond forfeited to the supplier, or the
+    /// supplier's graded share). Any shortfall falls back to the winner's award.
+    pub fn set_loser_pays_arbiter_fee(
+        env: Env,
+        buyer: Address,
+        supplier: Address,
+        shipment_id: String,
+        enabled: bool,
+    ) {
+        Self::assert_not_paused(&env);
+        buyer.require_auth();
+        supplier.require_auth();
+
+        let shipment = Self::get_shipment_internal(&env, &shipment_id);
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment is not active");
+        }
+        if !shipment.buyers.contains(&buyer) {
+            panic!("only buyer can set fee allocation");
+        }
+        if shipment.supplier != supplier {
+            panic!("only supplier can set fee allocation");
+        }
+        if shipment.open_dispute_count > 0 {
+            panic!("cannot change fee allocation during open dispute");
+        }
+
+        let key = DataKeyExt4::LoserPaysArbiterFee(shipment_id.clone());
+        if enabled {
+            env.storage().persistent().set(&key, &true);
+        } else {
+            env.storage().persistent().remove(&key);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "loser_pays_arbiter_fee_set"), shipment_id),
+            enabled,
+        );
+    }
+
+    /// Whether loser-pays arbiter fee allocation is enabled for a shipment.
+    pub fn get_loser_pays_arbiter_fee(env: Env, shipment_id: String) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKeyExt4::LoserPaysArbiterFee(shipment_id))
+            .unwrap_or(false)
+    }
+}
+
+impl ChainSettleContract {
+    /// Invoice factoring: financier currently entitled to supplier payouts, if any.
+    fn payout_assignee(env: &Env, shipment_id: &String) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get::<DataKeyExt4, PayoutAssignment>(&DataKeyExt4::PayoutAssignment(
+                shipment_id.clone(),
+            ))
+            .map(|a| a.financier)
+    }
+
+    /// Loser-pays: portion of `arbiter_fee` covered by `loser_funds` (money the
+    /// losing party would otherwise receive from this resolution). The caller
+    /// reduces the loser's funds by the returned amount and deducts only the
+    /// remainder from the winner's award. Returns 0 when loser-pays is disabled.
+    fn loser_pays_cover(
+        env: &Env,
+        shipment_id: &String,
+        milestone_index: u32,
+        arbiter_fee: i128,
+        loser_funds: i128,
+    ) -> i128 {
+        let enabled: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKeyExt4::LoserPaysArbiterFee(shipment_id.clone()))
+            .unwrap_or(false);
+        if !enabled || arbiter_fee <= 0 {
+            return 0;
+        }
+        let cover = arbiter_fee.min(loser_funds.max(0));
+        env.events().publish(
+            (Symbol::new(env, "arbiter_fee_allocated"), shipment_id.clone()),
+            (milestone_index, arbiter_fee, cover, arbiter_fee - cover),
+        );
+        cover
+    }
+}
+
+// ============================================================
 // #518–#521 SETTLEMENT EXTENSIONS
 // Quality-graded confirmation, pro-rata quantity milestones,
 // retainage and warranty holdback.
@@ -19732,8 +20173,10 @@ impl ChainSettleContract {
 
     /// #519: Pays a graded milestone: `payout` (the graded share of `gross`) to the
     /// supplier after platform fees, and `gross - payout` back to the primary buyer
-    /// (less `refund_fee`, e.g. an arbiter fee already paid out of it).
+    /// (less `refund_fee`, e.g. an arbiter fee already paid out of it). `payout_fee`
+    /// is likewise withheld from the supplier's net share (loser-pays arbiter fee).
     /// Returns (supplier net transfer, buyer refund, platform fee).
+    #[allow(clippy::too_many_arguments)]
     fn pay_graded_split(
         env: &Env,
         shipment: &Shipment,
@@ -19742,6 +20185,7 @@ impl ChainSettleContract {
         gross: i128,
         grade_bps: u32,
         refund_fee: i128,
+        payout_fee: i128,
     ) -> (i128, i128, i128) {
         let payout = (gross * grade_bps as i128) / 10_000;
         let refund = (gross - payout - refund_fee).max(0);
@@ -19750,7 +20194,8 @@ impl ChainSettleContract {
         let mut fee_amount: i128 = 0;
         let mut net = 0;
         if payout > 0 {
-            net = Self::deduct_fee(env, payout, &shipment.token, &mut fee_amount);
+            net = (Self::deduct_fee(env, payout, &shipment.token, &mut fee_amount) - payout_fee)
+                .max(0);
             Self::check_circuit_breaker(env, payout);
             Self::check_address_outflow(env, &shipment.supplier, payout);
             Self::pay_milestone_to_payees(
